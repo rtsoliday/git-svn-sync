@@ -26,9 +26,10 @@ Safety:
   - Only acts on files tracked by each VCS.
   - Per-file confirmation unless --yes is given.
   - Supports --dry-run.
+  - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. Use --rebaseline to populate this file.
 
 Usage:
-  python git_svn_sync.py --git /path/to/git_wc --svn /path/to/svn_wc [--yes] [--dry-run]
+  python git_svn_sync.py --git /path/to/git_wc --svn /path/to/svn_wc [--yes] [--dry-run] [--rebaseline]
 """
 
 import argparse
@@ -39,6 +40,32 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+# Path to ignore file containing newline-separated absolute paths to ignore
+IGNORE_FILE = os.path.expanduser("~/.git-svn-sync.ignore")
+
+def load_ignore_set() -> Set[str]:
+    """Return the set of absolute paths listed in the ignore file (if it exists)."""
+    try:
+        with open(IGNORE_FILE, "r") as f:
+            return {line.strip() for line in f if line.strip() and not line.strip().startswith("#")}
+    except FileNotFoundError:
+        return set()
+
+def append_to_ignore(paths: Iterable[str], existing: Optional[Set[str]] = None) -> List[str]:
+    """Append the given absolute paths to the ignore file if not already present.
+
+    Returns the list of newly added paths.
+    """
+    if existing is None:
+        existing = load_ignore_set()
+    new = [p for p in paths if p not in existing]
+    if not new:
+        return []
+    with open(IGNORE_FILE, "a") as f:
+        for p in new:
+            f.write(p + "\n")
+    return new
 
 # ----- Utilities -----
 
@@ -365,12 +392,14 @@ def main():
     parser.add_argument("--svn", required=True, help="Path to SVN working copy root")
     parser.add_argument("--yes", action="store_true", help="Assume 'yes' for all prompts (non-interactive)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without changing anything")
+    parser.add_argument("--rebaseline", action="store_true", help="Update ignore list with files present only in one repo and exit")
     args = parser.parse_args()
 
     git_root = os.path.abspath(args.git)
     svn_root = os.path.abspath(args.svn)
     auto_yes = args.yes
     dry_run = args.dry_run
+    rebaseline = args.rebaseline
 
     # Sanity checks
     for root, name, probe in [
@@ -391,6 +420,31 @@ def main():
 
     print(f"  Git tracked files: {len(git_set)}")
     print(f"  SVN tracked files: {len(svn_set)}")
+
+    ignore_set_abs = load_ignore_set()
+    if ignore_set_abs:
+        ignore_git: Set[str] = set()
+        ignore_svn: Set[str] = set()
+        for p in ignore_set_abs:
+            rel_git = os.path.relpath(p, git_root)
+            if rel_git != "." and not rel_git.startswith("..") and not os.path.isabs(rel_git):
+                ignore_git.add(rel_git)
+            rel_svn = os.path.relpath(p, svn_root)
+            if rel_svn != "." and not rel_svn.startswith("..") and not os.path.isabs(rel_svn):
+                ignore_svn.add(rel_svn)
+        git_set -= ignore_git
+        svn_set -= ignore_svn
+
+    if rebaseline:
+        only_git = sorted(git_set - svn_set)
+        only_svn = sorted(svn_set - git_set)
+        to_add_abs = [os.path.join(git_root, p) for p in only_git] + [os.path.join(svn_root, p) for p in only_svn]
+        added = append_to_ignore(to_add_abs, existing=ignore_set_abs)
+        if added:
+            print(f"Added {len(added)} paths to {IGNORE_FILE}")
+        else:
+            print("No new paths to add to ignore file.")
+        return
 
     status = compare_and_collect(git_root, svn_root, git_set, svn_set)
 
