@@ -27,6 +27,7 @@ Safety:
   - Per-file confirmation unless --yes is given.
   - Supports --dry-run.
   - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. Use --rebaseline to populate this file.
+  - Verifies both working copies are up to date with their remotes before running.
 
 Usage:
   python git_svn_sync.py --git /path/to/git_wc --svn /path/to/svn_wc [--yes] [--dry-run] [--rebaseline]
@@ -134,7 +135,26 @@ def git_rm_commit(git_root: str, relpath: str, message: str, dry_run: bool):
     run(["git", "rm", "--", relpath], cwd=git_root)
     run(["git", "commit", "-m", message, "--", relpath], cwd=git_root)
 
+def git_is_up_to_date(git_root: str) -> bool:
+    """Return True if the Git working copy is up to date with its upstream."""
+    try:
+        run(["git", "fetch"], cwd=git_root)
+        local = run(["git", "rev-parse", "HEAD"], cwd=git_root).stdout.strip()
+        remote = run(["git", "rev-parse", "@{u}"], cwd=git_root).stdout.strip()
+        return local == remote
+    except subprocess.CalledProcessError:
+        return False
+
 # ----- SVN helpers -----
+
+def svn_is_up_to_date(svn_root: str) -> bool:
+    """Return True if the SVN working copy is up to date with the repository."""
+    try:
+        local = run(["svn", "info", "--show-item", "revision"], cwd=svn_root).stdout.strip()
+        remote = run(["svn", "info", "-r", "HEAD", "--show-item", "revision"], cwd=svn_root).stdout.strip()
+        return local == remote
+    except subprocess.CalledProcessError:
+        return False
 
 def svn_ls_files(svn_root: str) -> Set[str]:
     """
@@ -414,6 +434,22 @@ def main():
         except FileNotFoundError:
             print(f"Error: Required tool for {name} not found on PATH.", file=sys.stderr)
             sys.exit(1)
+
+    if not git_is_up_to_date(git_root):
+        print(
+            f"Error: Git working copy in {git_root} is not up to date with its upstream.\n"
+            f"Please run 'git pull' in {git_root} before running this script.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not svn_is_up_to_date(svn_root):
+        print(
+            f"Error: SVN working copy in {svn_root} is not up to date with the repository.\n"
+            f"Please run 'svn update' in {svn_root} before running this script.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print("Indexing versioned files...")
     git_set, svn_set = build_index(git_root, svn_root)
