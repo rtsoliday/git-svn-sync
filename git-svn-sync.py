@@ -25,14 +25,14 @@ What it does:
 
 Safety:
   - Only acts on files tracked by each VCS.
-  - Per-file confirmation unless --yes is given.
-  - Supports --dry-run.
-  - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. The file must contain entries for both
-    working copies; run with --rebaseline to (re)populate it.
+    - Per-file confirmation unless -yes is given.
+    - Supports -dry-run.
+    - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. The file must contain entries for both
+      working copies; run with -rebaseline to (re)populate it.
   - Verifies both working copies are up to date with their remotes before running.
 
-Usage:
-  python git_svn_sync.py --git /path/to/git_wc --svn /path/to/svn_wc [--yes] [--dry-run] [--rebaseline]
+  Usage:
+    python git_svn_sync.py -git /path/to/git_wc -svn /path/to/svn_wc [-yes] [-dry-run] [-rebaseline]
 """
 
 import argparse
@@ -458,11 +458,11 @@ def augment_message(msg: str, author: Optional[str]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Sync files between Git and SVN working copies.")
-    parser.add_argument("--git", required=True, help="Path to Git working copy root")
-    parser.add_argument("--svn", required=True, help="Path to SVN working copy root")
-    parser.add_argument("--yes", action="store_true", help="Assume 'yes' for all prompts (non-interactive)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without changing anything")
-    parser.add_argument("--rebaseline", action="store_true", help="Update ignore list with files present only in one repo and exit")
+    parser.add_argument("-git", required=True, help="Path to Git working copy root")
+    parser.add_argument("-svn", required=True, help="Path to SVN working copy root")
+    parser.add_argument("-yes", action="store_true", help="Assume 'yes' for all prompts (non-interactive)")
+    parser.add_argument("-dry-run", action="store_true", help="Show what would happen without changing anything")
+    parser.add_argument("-rebaseline", action="store_true", help="Update ignore list with files present only in one repo and exit")
     args = parser.parse_args()
 
     git_root = os.path.abspath(args.git)
@@ -520,7 +520,7 @@ def main():
 
     if not rebaseline and (not ignore_git or not ignore_svn):
         print(
-            f"Error: {IGNORE_FILE} lacks entries for {'Git' if not ignore_git else ''}{' and ' if not ignore_git and not ignore_svn else ''}{'SVN' if not ignore_svn else ''}.\nPlease run with --rebaseline",
+            f"Error: {IGNORE_FILE} lacks entries for {'Git' if not ignore_git else ''}{' and ' if not ignore_git and not ignore_svn else ''}{'SVN' if not ignore_svn else ''}.\nPlease run with -rebaseline",
             file=sys.stderr,
         )
         sys.exit(1)
