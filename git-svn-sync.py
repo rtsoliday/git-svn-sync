@@ -192,24 +192,21 @@ def svn_last_change(
     """
     try:
         # Timestamp & author
-        cp_info = run(
-            [
-                "svn",
-                "info",
-                "--show-item",
-                "last-changed-date",
-                "--show-item",
-                "last-changed-author",
-                "--",
-                relpath,
-            ],
+        # Fetch last change date and author separately.  Older versions of SVN
+        # only output the last requested item when multiple --show-item flags are
+        # provided, so invoking once with both values would return only the
+        # author (or date) and break parsing.  Querying each item individually
+        # avoids that pitfall and keeps the code compatible across SVN versions.
+        cp_date = run(
+            ["svn", "info", "--show-item", "last-changed-date", "--", relpath],
             cwd=svn_root,
         )
-        info_lines = [l for l in cp_info.stdout.splitlines() if l.strip()]
-        if not info_lines:
-            return None, None, None
-        date_str = info_lines[0].strip()
-        author = info_lines[1].strip() if len(info_lines) > 1 else None
+        cp_author = run(
+            ["svn", "info", "--show-item", "last-changed-author", "--", relpath],
+            cwd=svn_root,
+        )
+        date_str = cp_date.stdout.strip()
+        author = cp_author.stdout.strip() or None
         if not date_str:
             return None, None, None
         # Parse ISO 8601 to epoch (YYYY-MM-DDTHH:MM:SS.ZZZZZZZZZZZZ)
