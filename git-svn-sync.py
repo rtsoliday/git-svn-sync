@@ -161,6 +161,18 @@ def git_is_up_to_date(git_root: str) -> bool:
     except subprocess.CalledProcessError:
         return False
 
+def git_uncommitted_files(git_root: str) -> Set[str]:
+    """Return set of files with uncommitted changes in the Git working copy."""
+    cp = run(["git", "status", "--porcelain"], cwd=git_root)
+    files: Set[str] = set()
+    for line in cp.stdout.splitlines():
+        if not line or line.startswith("??"):
+            continue  # ignore untracked files
+        status = line[:2]
+        if status.strip():
+            files.add(line[3:])
+    return files
+
 # ----- SVN helpers -----
 
 def svn_is_up_to_date(svn_root: str) -> bool:
@@ -171,6 +183,19 @@ def svn_is_up_to_date(svn_root: str) -> bool:
         return local == remote
     except subprocess.CalledProcessError:
         return False
+
+def svn_uncommitted_files(svn_root: str) -> Set[str]:
+    """Return set of files with uncommitted changes in the SVN working copy."""
+    cp = run(["svn", "status"], cwd=svn_root)
+    files: Set[str] = set()
+    for line in cp.stdout.splitlines():
+        if not line:
+            continue
+        code = line[0]
+        if code in ("?", "X", " "):
+            continue
+        files.add(line[8:].strip())
+    return files
 
 def svn_ls_files(svn_root: str) -> Set[str]:
     """
@@ -556,6 +581,22 @@ def main():
         )
         sys.exit(1)
 
+    dirty_git = git_uncommitted_files(git_root)
+    dirty_svn = svn_uncommitted_files(svn_root)
+    dirty_all = dirty_git.union(dirty_svn)
+    if dirty_all:
+        print("The following files have uncommitted changes and will be ignored:")
+        if dirty_git:
+            print("  Git:")
+            for p in sorted(dirty_git):
+                print(f"    {p}")
+        if dirty_svn:
+            print("  SVN:")
+            for p in sorted(dirty_svn):
+                print(f"    {p}")
+    else:
+        print("No uncommitted changes detected.")
+
     print("Indexing versioned files...")
     git_set, svn_set = build_index(git_root, svn_root)
 
@@ -582,6 +623,9 @@ def main():
 
     git_set -= ignore_git
     svn_set -= ignore_svn
+
+    git_set -= dirty_all
+    svn_set -= dirty_all
 
     if rebaseline:
         only_git = sorted(git_set - svn_set)
