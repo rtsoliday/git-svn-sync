@@ -458,15 +458,70 @@ def augment_message(msg: str, author: Optional[str]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Sync files between Git and SVN working copies.")
-    parser.add_argument("-git", required=True, help="Path to Git working copy root")
-    parser.add_argument("-svn", required=True, help="Path to SVN working copy root")
+    parser.add_argument("-git", help="Path to Git working copy root")
+    parser.add_argument("-svn", help="Path to SVN working copy root")
+    parser.add_argument("-sdds", action="store_true", help="Shortcut for -git ~/github/SDDS -svn ~/epics/extensions/src/SDDS")
+    parser.add_argument(
+        "-sddsepics",
+        action="store_true",
+        help="Shortcut for -git ~/github/SDDS-EPICS -svn ~/epics/extensions/src/SDDSepics",
+    )
+    parser.add_argument(
+        "-elegant",
+        action="store_true",
+        help="Shortcut for -git ~/github/elegant -svn ~/oag/apps/src/elegant",
+    )
+    parser.add_argument(
+        "-spiffe",
+        action="store_true",
+        help="Shortcut for -git ~/github/spiffe -svn ~/oag/apps/src/spiffe",
+    )
+    parser.add_argument(
+        "-clinchor",
+        action="store_true",
+        help="Shortcut for -git ~/github/clinchor -svn ~/oag/apps/src/clinchor",
+    )
+    parser.add_argument(
+        "-shield",
+        action="store_true",
+        help="Shortcut for -git ~/github/shield -svn ~/oag/apps/src/shield",
+    )
     parser.add_argument("-yes", action="store_true", help="Assume 'yes' for all prompts (non-interactive)")
     parser.add_argument("-dry-run", action="store_true", help="Show what would happen without changing anything")
-    parser.add_argument("-rebaseline", action="store_true", help="Update ignore list with files present only in one repo and exit")
+    parser.add_argument(
+        "-rebaseline",
+        action="store_true",
+        help="Update ignore list with files present only in one repo and exit",
+    )
     args = parser.parse_args()
 
-    git_root = os.path.abspath(args.git)
-    svn_root = os.path.abspath(args.svn)
+    presets = {
+        "sdds": ("~/github/SDDS", "~/epics/extensions/src/SDDS"),
+        "sddsepics": ("~/github/SDDS-EPICS", "~/epics/extensions/src/SDDSepics"),
+        "elegant": ("~/github/elegant", "~/oag/apps/src/elegant"),
+        "spiffe": ("~/github/spiffe", "~/oag/apps/src/spiffe"),
+        "clinchor": ("~/github/clinchor", "~/oag/apps/src/clinchor"),
+        "shield": ("~/github/shield", "~/oag/apps/src/shield"),
+    }
+
+    chosen_preset = None
+    for name in presets:
+        if getattr(args, name):
+            if chosen_preset is not None:
+                parser.error("Multiple preset options specified; choose only one")
+            chosen_preset = name
+
+    if chosen_preset:
+        if args.git or args.svn:
+            parser.error("Cannot combine preset options with -git or -svn")
+        git_root_raw, svn_root_raw = presets[chosen_preset]
+    else:
+        if not (args.git and args.svn):
+            parser.error("Must specify -git and -svn or one preset option")
+        git_root_raw, svn_root_raw = args.git, args.svn
+
+    git_root = os.path.abspath(os.path.expanduser(git_root_raw))
+    svn_root = os.path.abspath(os.path.expanduser(svn_root_raw))
     auto_yes = args.yes
     dry_run = args.dry_run
     rebaseline = args.rebaseline
