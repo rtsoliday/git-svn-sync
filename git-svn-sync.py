@@ -21,6 +21,7 @@ What it does:
        - Prompts to copy newer -> older and commit using the same message with author noted.
   4) For files present in only one repo:
        - Prompts to add to the other repo (default) or remove from the current repo, and commits.
+  5) After committing to Git, pushes the change to `origin master` so the remote trunk stays updated.
 
 Safety:
   - Only acts on files tracked by each VCS.
@@ -134,17 +135,21 @@ def git_add_commit(git_root: str, relpath: str, message: str, dry_run: bool):
     if dry_run:
         print(f"[dry-run] git add -- {relpath}")
         print(f"[dry-run] git commit -m {message!r} -- {relpath}")
+        print(f"[dry-run] git push origin master")
         return
     run(["git", "add", "--", relpath], cwd=git_root)
     run(["git", "commit", "-m", message, "--", relpath], cwd=git_root)
+    run(["git", "push", "origin", "master"], cwd=git_root)
 
 def git_rm_commit(git_root: str, relpath: str, message: str, dry_run: bool):
     if dry_run:
         print(f"[dry-run] git rm -- {relpath}")
         print(f"[dry-run] git commit -m {message!r} -- {relpath}")
+        print(f"[dry-run] git push origin master")
         return
     run(["git", "rm", "--", relpath], cwd=git_root)
     run(["git", "commit", "-m", message, "--", relpath], cwd=git_root)
+    run(["git", "push", "origin", "master"], cwd=git_root)
 
 def git_is_up_to_date(git_root: str) -> bool:
     """Return True if the Git working copy is up to date with its upstream."""
