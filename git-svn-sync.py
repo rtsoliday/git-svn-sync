@@ -17,8 +17,8 @@ What it does:
        - SVN: `svn list -R` (from working copy)
   2) Compares file contents (SHA-256) for intersection, and finds files present only in one repo.
   3) For mismatched files:
-       - Determines which repo has the most recent change and fetches its last commit message.
-       - Prompts to copy newer -> older and commit using the same message.
+       - Determines which repo has the most recent change and fetches its last commit message and author.
+       - Prompts to copy newer -> older and commit using the same message with author noted.
   4) For files present in only one repo:
        - Prompts to add to the other repo (default) or remove from the current repo, and commits.
 
@@ -26,7 +26,8 @@ Safety:
   - Only acts on files tracked by each VCS.
   - Per-file confirmation unless --yes is given.
   - Supports --dry-run.
-  - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. Use --rebaseline to populate this file.
+  - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. The file must contain entries for both
+    working copies; run with --rebaseline to (re)populate it.
   - Verifies both working copies are up to date with their remotes before running.
 
 Usage:
@@ -105,19 +106,29 @@ def git_ls_files(git_root: str) -> Set[str]:
     files = {line.strip() for line in cp.stdout.splitlines() if line.strip()}
     return files
 
-def git_last_change(git_root: str, relpath: str) -> Tuple[Optional[int], Optional[str]]:
+def git_last_change(
+    git_root: str, relpath: str
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
-    Return (timestamp_epoch, message) for the last commit that touched relpath.
-    Returns (None, None) if file has no history (e.g., not tracked).
+    Return (timestamp_epoch, message, author) for the last commit that touched relpath.
+    Returns (None, None, None) if file has no history (e.g., not tracked).
     """
     try:
-        t = run(["git", "log", "-1", "--format=%ct", "--", relpath], cwd=git_root).stdout.strip()
-        msg = run(["git", "log", "-1", "--pretty=%B", "--", relpath], cwd=git_root).stdout.strip()
+        info = run(
+            ["git", "log", "-1", "--format=%ct%n%an", "--", relpath], cwd=git_root
+        ).stdout.splitlines()
+        msg = run(
+            ["git", "log", "-1", "--pretty=%B", "--", relpath], cwd=git_root
+        ).stdout.strip()
+        if not info:
+            return None, None, None
+        t = info[0].strip()
+        author = info[1].strip() if len(info) > 1 else None
         if not t:
-            return None, None
-        return int(t), msg
+            return None, None, None
+        return int(t), msg, author
     except subprocess.CalledProcessError:
-        return None, None
+        return None, None, None
 
 def git_add_commit(git_root: str, relpath: str, message: str, dry_run: bool):
     if dry_run:
@@ -171,18 +182,36 @@ def svn_ls_files(svn_root: str) -> Set[str]:
         files.add(line)
     return files
 
-def svn_last_change(svn_root: str, relpath: str) -> Tuple[Optional[int], Optional[str]]:
+def svn_last_change(
+    svn_root: str, relpath: str
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
-    Return (timestamp_epoch, message) for the last change that touched relpath in SVN.
-    Uses `svn info --show-item last-changed-date` (SVN 1.9+) for time,
+    Return (timestamp_epoch, message, author) for the last change that touched relpath in SVN.
+    Uses `svn info --show-item last-changed-date` and `last-changed-author` for metadata
     and `svn log -l 1` for message.
     """
     try:
-        # Timestamp
-        cp_info = run(["svn", "info", "--show-item", "last-changed-date", "--", relpath], cwd=svn_root)
-        date_str = cp_info.stdout.strip()
+        # Timestamp & author
+        cp_info = run(
+            [
+                "svn",
+                "info",
+                "--show-item",
+                "last-changed-date",
+                "--show-item",
+                "last-changed-author",
+                "--",
+                relpath,
+            ],
+            cwd=svn_root,
+        )
+        info_lines = [l for l in cp_info.stdout.splitlines() if l.strip()]
+        if not info_lines:
+            return None, None, None
+        date_str = info_lines[0].strip()
+        author = info_lines[1].strip() if len(info_lines) > 1 else None
         if not date_str:
-            return None, None
+            return None, None, None
         # Parse ISO 8601 to epoch (YYYY-MM-DDTHH:MM:SS.ZZZZZZZZZZZZ)
         # Use Python's fromisoformat after stripping timezone if present; fallback to `date`?
         # Simpler: ask svn for epoch with `--show-item last-changed-revision` then get log for that rev with --xml,
@@ -209,9 +238,9 @@ def svn_last_change(svn_root: str, relpath: str) -> Tuple[Optional[int], Optiona
         # Message
         cp_msg = run(["svn", "log", "-l", "1", "--", relpath], cwd=svn_root)
         message = extract_last_svn_log_message(cp_msg.stdout)
-        return ts, message
+        return ts, message, author
     except subprocess.CalledProcessError:
-        return None, None
+        return None, None, None
 
 def extract_last_svn_log_message(log_output: str) -> str:
     """
@@ -257,8 +286,10 @@ class FileStatus:
     same_content: Optional[bool]  # None if not present in both
     git_ts: Optional[int]
     git_msg: Optional[str]
+    git_author: Optional[str]
     svn_ts: Optional[int]
     svn_msg: Optional[str]
+    svn_author: Optional[str]
 
 def build_index(git_root: str, svn_root: str) -> Tuple[Set[str], Set[str]]:
     git_set = git_ls_files(git_root)
@@ -278,7 +309,7 @@ def compare_and_collect(
         in_git = rel in git_set
         in_svn = rel in svn_set
         same: Optional[bool] = None
-        git_ts = git_msg = svn_ts = svn_msg = None
+        git_ts = git_msg = git_author = svn_ts = svn_msg = svn_author = None
 
         if in_git and in_svn:
             git_abs = os.path.join(git_root, rel)
@@ -290,8 +321,8 @@ def compare_and_collect(
                 same = False
 
             if not same:
-                git_ts, git_msg = git_last_change(git_root, rel)
-                svn_ts, svn_msg = svn_last_change(svn_root, rel)
+                git_ts, git_msg, git_author = git_last_change(git_root, rel)
+                svn_ts, svn_msg, svn_author = svn_last_change(svn_root, rel)
 
         status[rel] = FileStatus(
             relpath=rel,
@@ -300,8 +331,10 @@ def compare_and_collect(
             same_content=same,
             git_ts=git_ts,
             git_msg=git_msg,
+            git_author=git_author,
             svn_ts=svn_ts,
             svn_msg=svn_msg,
+            svn_author=svn_author,
         )
 
     return status
@@ -344,20 +377,24 @@ def handle_mismatch(
     newer_ts = git_ts if newer == "git" else svn_ts
     older_ts = svn_ts if newer == "git" else git_ts
     newer_msg = st.git_msg if newer == "git" else st.svn_msg
+    newer_author = st.git_author if newer == "git" else st.svn_author
 
     print(f"\nDIFF: {rel}")
     print(f"  Last change: {newer.upper()} is newer ({newer_ts}), {older.upper()} older ({older_ts})")
-    print(f"  Last commit message ({newer.upper()}):\n    {indent_message(newer_msg)}")
+    author_str = f" by {newer_author}" if newer_author else ""
+    print(f"  Last commit message ({newer.upper()}{author_str}):\n    {indent_message(newer_msg)}")
 
     if prompt_yes_no(f"Sync {rel}? Copy {newer.upper()} -> {older.upper()} and commit with that message.", default_yes=True, auto_yes=auto_yes):
         if newer == "git":
             # Copy git -> svn, then commit in SVN
             copy_file(git_root, svn_root, rel, dry_run)
-            svn_add_commit(svn_root, rel, newer_msg or f"Sync {rel} from Git", dry_run)
+            commit_msg = augment_message(newer_msg or f"Sync {rel} from Git", newer_author)
+            svn_add_commit(svn_root, rel, commit_msg, dry_run)
         else:
             # Copy svn -> git, then commit in Git
             copy_file(svn_root, git_root, rel, dry_run)
-            git_add_commit(git_root, rel, newer_msg or f"Sync {rel} from SVN", dry_run)
+            commit_msg = augment_message(newer_msg or f"Sync {rel} from SVN", newer_author)
+            git_add_commit(git_root, rel, commit_msg, dry_run)
     else:
         print("  Skipped.")
 
@@ -383,28 +420,39 @@ def handle_only_in_one(
             # Add to SVN
             copy_file(git_root, svn_root, rel, dry_run)
             # Use the file's last commit message from Git if available, else a generic message
-            ts, msg = git_last_change(git_root, rel)
-            svn_add_commit(svn_root, rel, msg or f"Add {rel} (synced from Git)", dry_run)
+            ts, msg, author = git_last_change(git_root, rel)
+            commit_msg = augment_message(msg or f"Add {rel} (synced from Git)", author)
+            svn_add_commit(svn_root, rel, commit_msg, dry_run)
         else:
             # Remove from Git
-            ts, msg = git_last_change(git_root, rel)
-            git_rm_commit(git_root, rel, msg or f"Remove {rel} (not present in SVN)", dry_run)
+            ts, msg, author = git_last_change(git_root, rel)
+            commit_msg = augment_message(msg or f"Remove {rel} (not present in SVN)", author)
+            git_rm_commit(git_root, rel, commit_msg, dry_run)
     else:
         if do_add:
             # Add to Git
             copy_file(svn_root, git_root, rel, dry_run)
-            ts, msg = svn_last_change(svn_root, rel)
-            git_add_commit(git_root, rel, msg or f"Add {rel} (synced from SVN)", dry_run)
+            ts, msg, author = svn_last_change(svn_root, rel)
+            commit_msg = augment_message(msg or f"Add {rel} (synced from SVN)", author)
+            git_add_commit(git_root, rel, commit_msg, dry_run)
         else:
             # Remove from SVN
-            ts, msg = svn_last_change(svn_root, rel)
-            svn_delete_commit(svn_root, rel, msg or f"Remove {rel} (not present in Git)", dry_run)
+            ts, msg, author = svn_last_change(svn_root, rel)
+            commit_msg = augment_message(msg or f"Remove {rel} (not present in Git)", author)
+            svn_delete_commit(svn_root, rel, commit_msg, dry_run)
 
 def indent_message(msg: Optional[str]) -> str:
     if not msg:
         return "(no message)"
     lines = msg.splitlines() or [msg]
     return "\n    ".join(lines)
+
+
+def augment_message(msg: str, author: Optional[str]) -> str:
+    """Append original author information to commit message if provided."""
+    if author:
+        return f"{msg}\n\nOriginal author: {author}"
+    return msg
 
 def main():
     parser = argparse.ArgumentParser(description="Sync files between Git and SVN working copies.")
@@ -438,7 +486,7 @@ def main():
     if not git_is_up_to_date(git_root):
         print(
             f"Error: Git working copy in {git_root} is not up to date with its upstream.\n"
-            f"Please run 'git pull' in {git_root} before running this script.",
+            f"Please run 'git pull origin master' in {git_root} before running this script.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -458,18 +506,25 @@ def main():
     print(f"  SVN tracked files: {len(svn_set)}")
 
     ignore_set_abs = load_ignore_set()
-    if ignore_set_abs:
-        ignore_git: Set[str] = set()
-        ignore_svn: Set[str] = set()
-        for p in ignore_set_abs:
-            rel_git = os.path.relpath(p, git_root)
-            if rel_git != "." and not rel_git.startswith("..") and not os.path.isabs(rel_git):
-                ignore_git.add(rel_git)
-            rel_svn = os.path.relpath(p, svn_root)
-            if rel_svn != "." and not rel_svn.startswith("..") and not os.path.isabs(rel_svn):
-                ignore_svn.add(rel_svn)
-        git_set -= ignore_git
-        svn_set -= ignore_svn
+    ignore_git: Set[str] = set()
+    ignore_svn: Set[str] = set()
+    for p in ignore_set_abs:
+        rel_git = os.path.relpath(p, git_root)
+        if rel_git != "." and not rel_git.startswith("..") and not os.path.isabs(rel_git):
+            ignore_git.add(rel_git)
+        rel_svn = os.path.relpath(p, svn_root)
+        if rel_svn != "." and not rel_svn.startswith("..") and not os.path.isabs(rel_svn):
+            ignore_svn.add(rel_svn)
+
+    if not rebaseline and (not ignore_git or not ignore_svn):
+        print(
+            f"Error: {IGNORE_FILE} lacks entries for {'Git' if not ignore_git else ''}{' and ' if not ignore_git and not ignore_svn else ''}{'SVN' if not ignore_svn else ''}.\nPlease run with --rebaseline",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    git_set -= ignore_git
+    svn_set -= ignore_svn
 
     if rebaseline:
         only_git = sorted(git_set - svn_set)
@@ -479,7 +534,18 @@ def main():
         if added:
             print(f"Added {len(added)} paths to {IGNORE_FILE}")
         else:
-            print("No new paths to add to ignore file.")
+            placeholders: List[str] = []
+            if not any(os.path.commonpath([git_root, p]) == git_root for p in ignore_set_abs):
+                placeholders.append(os.path.join(git_root, ".ignore"))
+            if not any(os.path.commonpath([svn_root, p]) == svn_root for p in ignore_set_abs):
+                placeholders.append(os.path.join(svn_root, ".ignore"))
+            if placeholders:
+                append_to_ignore(placeholders, existing=ignore_set_abs)
+                print(
+                    f"Added placeholder paths to {IGNORE_FILE} to record rebaseline."
+                )
+            else:
+                print("No new paths to add to ignore file.")
         return
 
     status = compare_and_collect(git_root, svn_root, git_set, svn_set)
