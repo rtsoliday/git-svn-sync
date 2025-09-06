@@ -37,6 +37,7 @@ Safety:
 
 import argparse
 import hashlib
+import datetime
 import os
 import shutil
 import subprocess
@@ -130,6 +131,23 @@ def git_last_change(
         return int(t), msg, author
     except subprocess.CalledProcessError:
         return None, None, None
+
+def git_log_messages_since(git_root: str, relpath: str, since_ts: Optional[int]) -> List[str]:
+    """Return commit messages for relpath since the given timestamp (exclusive).
+
+    Messages are returned oldest-first. If since_ts is None, all messages are
+    returned.
+    """
+    try:
+        cmd = ["git", "log", "--format=%B%x1e", "--reverse"]
+        if since_ts is not None and since_ts >= 0:
+            cmd.insert(2, f"--since={since_ts + 1}")
+        cmd.extend(["--", relpath])
+        cp = run(cmd, cwd=git_root)
+        raw = cp.stdout.split("\x1e")
+        return [m.strip() for m in raw if m.strip()]
+    except subprocess.CalledProcessError:
+        return []
 
 def git_add_commit(git_root: str, relpath: str, message: str, dry_run: bool):
     if dry_run:
@@ -269,18 +287,41 @@ def svn_last_change(
     except subprocess.CalledProcessError:
         return None, None, None
 
-def extract_last_svn_log_message(log_output: str) -> str:
+def svn_log_messages_since(svn_root: str, relpath: str, since_ts: Optional[int]) -> List[str]:
+    """Return commit messages for relpath since the given timestamp (exclusive).
+
+    Messages are returned oldest-first. If since_ts is None, all messages are
+    returned.
     """
-    Parses `svn log -l 1` output to pull the commit message (between the first dashed separators).
-    """
+    try:
+        cmd = ["svn", "log", "--reverse"]
+        if since_ts is not None and since_ts >= 0:
+            iso = datetime.datetime.utcfromtimestamp(since_ts + 1).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cmd.extend(["-r", f"{{{iso}}}:HEAD"])
+        cmd.extend(["--", relpath])
+        cp = run(cmd, cwd=svn_root)
+        return extract_svn_log_messages(cp.stdout)
+    except subprocess.CalledProcessError:
+        return []
+
+def extract_svn_log_messages(log_output: str) -> List[str]:
+    """Parse `svn log` output and return a list of commit messages."""
     lines = [l.rstrip("\n") for l in log_output.splitlines()]
     sep_indices = [i for i, l in enumerate(lines) if l.startswith("-" * 5)]
-    if len(sep_indices) >= 2:
-        start = sep_indices[0] + 2  # line after header line (author|date|rev)
-        end = sep_indices[1]
-        body = "\n".join(lines[start:end]).strip()
-        return body
-    # Fallback: entire output
+    messages: List[str] = []
+    for start, end in zip(sep_indices, sep_indices[1:]):
+        msg_start = start + 2
+        msg_end = end
+        msg = "\n".join(lines[msg_start:msg_end]).strip()
+        if msg:
+            messages.append(msg)
+    return messages
+
+def extract_last_svn_log_message(log_output: str) -> str:
+    """Extract the first commit message from `svn log` output."""
+    msgs = extract_svn_log_messages(log_output)
+    if msgs:
+        return msgs[0]
     return log_output.strip()
 
 def svn_add_commit(svn_root: str, relpath: str, message: str, dry_run: bool):
@@ -406,21 +447,27 @@ def handle_mismatch(
     newer_msg = st.git_msg if newer == "git" else st.svn_msg
     newer_author = st.git_author if newer == "git" else st.svn_author
 
+    if newer == "git":
+        msgs = git_log_messages_since(git_root, rel, older_ts)
+    else:
+        msgs = svn_log_messages_since(svn_root, rel, older_ts)
+    combined_msg = "\n\n".join(msgs) if msgs else newer_msg
+
     print(f"\nDIFF: {rel}")
     print(f"  Last change: {newer.upper()} is newer ({newer_ts}), {older.upper()} older ({older_ts})")
     author_str = f" by {newer_author}" if newer_author else ""
-    print(f"  Last commit message ({newer.upper()}{author_str}):\n    {indent_message(newer_msg)}")
+    print(f"  Commit message(s) ({newer.upper()}{author_str}):\n    {indent_message(combined_msg)}")
 
     if prompt_yes_no(f"Sync {rel}? Copy {newer.upper()} -> {older.upper()} and commit with that message.", default_yes=True, auto_yes=auto_yes):
         if newer == "git":
             # Copy git -> svn, then commit in SVN
             copy_file(git_root, svn_root, rel, dry_run)
-            commit_msg = augment_message(newer_msg or f"Sync {rel} from Git", newer_author)
+            commit_msg = augment_message(combined_msg or f"Sync {rel} from Git", newer_author)
             svn_add_commit(svn_root, rel, commit_msg, dry_run)
         else:
             # Copy svn -> git, then commit in Git
             copy_file(svn_root, git_root, rel, dry_run)
-            commit_msg = augment_message(newer_msg or f"Sync {rel} from SVN", newer_author)
+            commit_msg = augment_message(combined_msg or f"Sync {rel} from SVN", newer_author)
             git_add_commit(git_root, rel, commit_msg, dry_run)
     else:
         print("  Skipped.")
@@ -446,9 +493,11 @@ def handle_only_in_one(
         if do_add:
             # Add to SVN
             copy_file(git_root, svn_root, rel, dry_run)
-            # Use the file's last commit message from Git if available, else a generic message
-            ts, msg, author = git_last_change(git_root, rel)
-            commit_msg = augment_message(msg or f"Add {rel} (synced from Git)", author)
+            # Use the file's commit messages from Git if available, else a generic message
+            ts, last_msg, author = git_last_change(git_root, rel)
+            msgs = git_log_messages_since(git_root, rel, None)
+            combined = "\n\n".join(msgs) if msgs else last_msg
+            commit_msg = augment_message(combined or f"Add {rel} (synced from Git)", author)
             svn_add_commit(svn_root, rel, commit_msg, dry_run)
         else:
             # Remove from Git
@@ -459,8 +508,10 @@ def handle_only_in_one(
         if do_add:
             # Add to Git
             copy_file(svn_root, git_root, rel, dry_run)
-            ts, msg, author = svn_last_change(svn_root, rel)
-            commit_msg = augment_message(msg or f"Add {rel} (synced from SVN)", author)
+            ts, last_msg, author = svn_last_change(svn_root, rel)
+            msgs = svn_log_messages_since(svn_root, rel, None)
+            combined = "\n\n".join(msgs) if msgs else last_msg
+            commit_msg = augment_message(combined or f"Add {rel} (synced from SVN)", author)
             git_add_commit(git_root, rel, commit_msg, dry_run)
         else:
             # Remove from SVN
