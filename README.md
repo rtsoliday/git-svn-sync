@@ -30,7 +30,12 @@ python git-svn-sync.py -elegant    # ~/github/elegant <-> ~/oag/apps/src/elegant
 python git-svn-sync.py -spiffe     # ~/github/spiffe <-> ~/oag/apps/src/spiffe
 python git-svn-sync.py -clinchor   # ~/github/clinchor <-> ~/oag/apps/src/clinchor
 python git-svn-sync.py -shield     # ~/github/shield <-> ~/oag/apps/src/shield
+python git-svn-sync.py -oag        # ~/github/oag-src <-> ~/oag/apps/src
 ```
 
 Each preset is equivalent to invoking the script with the corresponding `-git`
 and `-svn` arguments.
+
+The `-oag` preset also ignores SVN-only top-level entries under
+`~/oag/apps/src`, so unrelated sibling trees and root-level files in that
+working copy do not need to be added to `~/.git-svn-sync.ignore`.

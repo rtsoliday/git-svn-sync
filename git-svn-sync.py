@@ -84,6 +84,21 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def tracked_path_signature(path: str) -> Optional[Tuple[str, str]]:
+    """
+    Return a comparable signature for a tracked path.
+
+    Regular files are compared by content hash. Symlinks are compared by their
+    link target string so broken-but-identical symlinks are treated as equal.
+    """
+    if os.path.islink(path):
+        return ("symlink", os.readlink(path))
+    if os.path.isfile(path):
+        return ("file", sha256_file(path))
+    if os.path.lexists(path):
+        return ("other", "")
+    return None
+
 def ensure_parent_dir(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -359,6 +374,41 @@ class FileStatus:
     svn_msg: Optional[str]
     svn_author: Optional[str]
 
+
+@dataclass(frozen=True)
+class Preset:
+    git_root: str
+    svn_root: str
+    allow_extra_svn_top_entries: bool = False
+    require_ignore_rebaseline: bool = True
+    ignored_relpaths: Tuple[str, ...] = ()
+
+
+def preset_ignored_svn_paths(
+    preset: Optional["Preset"],
+    git_set: Set[str],
+    svn_set: Set[str],
+) -> Set[str]:
+    """
+    Return SVN-relative paths that should be ignored for the selected preset.
+
+    Some SVN working copies intentionally contain sibling top-level entries
+    that are outside the Git mirror. In that case, ignore SVN files whose
+    first path component is not tracked anywhere in the Git mirror.
+    """
+    if not preset or not preset.allow_extra_svn_top_entries:
+        return set()
+
+    git_top_entries = {path.split("/", 1)[0] for path in git_set}
+    if not git_top_entries:
+        return set()
+
+    return {
+        relpath
+        for relpath in svn_set
+        if relpath.split("/", 1)[0] not in git_top_entries
+    }
+
 def build_index(git_root: str, svn_root: str) -> Tuple[Set[str], Set[str]]:
     git_set = git_ls_files(git_root)
     svn_set = svn_ls_files(svn_root)
@@ -382,8 +432,10 @@ def compare_and_collect(
         if in_git and in_svn:
             git_abs = os.path.join(git_root, rel)
             svn_abs = os.path.join(svn_root, rel)
-            if os.path.isfile(git_abs) and os.path.isfile(svn_abs):
-                same = (sha256_file(git_abs) == sha256_file(svn_abs))
+            git_sig = tracked_path_signature(git_abs)
+            svn_sig = tracked_path_signature(svn_abs)
+            if git_sig is not None and svn_sig is not None:
+                same = (git_sig == svn_sig)
             else:
                 # If one is a directory or missing on disk (shouldn't be if tracked), treat as different
                 same = False
@@ -414,6 +466,11 @@ def copy_file(src_root: str, dst_root: str, relpath: str, dry_run: bool):
         print(f"[dry-run] copy {src} -> {dst}")
         return
     ensure_parent_dir(dst)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+        return
     shutil.copy2(src, dst)
 
 def remove_file(root: str, relpath: str, dry_run: bool):
@@ -421,7 +478,7 @@ def remove_file(root: str, relpath: str, dry_run: bool):
     if dry_run:
         print(f"[dry-run] remove {path}")
         return
-    if os.path.exists(path):
+    if os.path.lexists(path):
         os.remove(path)
 
 def handle_mismatch(
@@ -562,6 +619,11 @@ def main():
         action="store_true",
         help="Shortcut for -git ~/github/shield -svn ~/oag/apps/src/shield",
     )
+    parser.add_argument(
+        "-oag",
+        action="store_true",
+        help="Shortcut for -git ~/github/oag-src -svn ~/oag/apps/src",
+    )
     parser.add_argument("-yes", action="store_true", help="Assume 'yes' for all prompts (non-interactive)")
     parser.add_argument("-dry-run", action="store_true", help="Show what would happen without changing anything")
     parser.add_argument(
@@ -572,25 +634,39 @@ def main():
     args = parser.parse_args()
 
     presets = {
-        "sdds": ("~/github/SDDS", "~/epics/extensions/src/SDDS"),
-        "sddsepics": ("~/github/SDDS-EPICS", "~/epics/extensions/src/SDDSepics"),
-        "elegant": ("~/github/elegant", "~/oag/apps/src/elegant"),
-        "spiffe": ("~/github/spiffe", "~/oag/apps/src/spiffe"),
-        "clinchor": ("~/github/clinchor", "~/oag/apps/src/clinchor"),
-        "shield": ("~/github/shield", "~/oag/apps/src/shield"),
+        "sdds": Preset("~/github/SDDS", "~/epics/extensions/src/SDDS"),
+        "sddsepics": Preset("~/github/SDDS-EPICS", "~/epics/extensions/src/SDDSepics"),
+        "elegant": Preset("~/github/elegant", "~/oag/apps/src/elegant"),
+        "spiffe": Preset("~/github/spiffe", "~/oag/apps/src/spiffe"),
+        "clinchor": Preset("~/github/clinchor", "~/oag/apps/src/clinchor"),
+        "shield": Preset("~/github/shield", "~/oag/apps/src/shield"),
+        "oag": Preset(
+            "~/github/oag-src",
+            "~/oag/apps/src",
+            allow_extra_svn_top_entries=True,
+            require_ignore_rebaseline=False,
+            ignored_relpaths=(
+                "Makefile",
+                "Makefile.build",
+                "Makefile.oag-build",
+                "Makefile.rules",
+            ),
+        ),
     }
 
-    chosen_preset = None
+    chosen_preset_name = None
     for name in presets:
         if getattr(args, name):
-            if chosen_preset is not None:
+            if chosen_preset_name is not None:
                 parser.error("Multiple preset options specified; choose only one")
-            chosen_preset = name
+            chosen_preset_name = name
+
+    chosen_preset = presets.get(chosen_preset_name)
 
     if chosen_preset:
         if args.git or args.svn:
             parser.error("Cannot combine preset options with -git or -svn")
-        git_root_raw, svn_root_raw = presets[chosen_preset]
+        git_root_raw, svn_root_raw = chosen_preset.git_root, chosen_preset.svn_root
     else:
         if not (args.git and args.svn):
             parser.error("Must specify -git and -svn or one preset option")
@@ -665,7 +741,26 @@ def main():
         if rel_svn != "." and not rel_svn.startswith("..") and not os.path.isabs(rel_svn):
             ignore_svn.add(rel_svn)
 
-    if not rebaseline and (not ignore_git or not ignore_svn):
+    preset_ignore_svn = preset_ignored_svn_paths(chosen_preset, git_set, svn_set)
+    if preset_ignore_svn:
+        print(
+            f"Ignoring {len(preset_ignore_svn)} SVN files under top-level entries not present in Git."
+        )
+        ignore_svn |= preset_ignore_svn
+
+    if chosen_preset and chosen_preset.ignored_relpaths:
+        preset_ignore_both = set(chosen_preset.ignored_relpaths)
+        ignored_present = sorted(p for p in preset_ignore_both if p in git_set or p in svn_set)
+        if ignored_present:
+            print(
+                "Ignoring preset-specific paths: "
+                + ", ".join(ignored_present)
+            )
+        ignore_git |= preset_ignore_both
+        ignore_svn |= preset_ignore_both
+
+    require_ignore_rebaseline = chosen_preset.require_ignore_rebaseline if chosen_preset else True
+    if not rebaseline and require_ignore_rebaseline and (not ignore_git or not ignore_svn):
         print(
             f"Error: {IGNORE_FILE} lacks entries for {'Git' if not ignore_git else ''}{' and ' if not ignore_git and not ignore_svn else ''}{'SVN' if not ignore_svn else ''}.\nPlease run with -rebaseline",
             file=sys.stderr,
