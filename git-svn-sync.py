@@ -29,6 +29,7 @@ Safety:
     - Supports -dry-run.
     - Paths listed in `~/.git-svn-sync.ignore` (absolute paths) are skipped. The file must contain entries for both
       working copies; run with -rebaseline to (re)populate it.
+    - Files under any `.kilo` directory are always skipped.
   - Verifies both working copies are up to date with their remotes before running.
 
   Usage:
@@ -47,6 +48,12 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # Path to ignore file containing newline-separated absolute paths to ignore
 IGNORE_FILE = os.path.expanduser("~/.git-svn-sync.ignore")
+ALWAYS_IGNORED_DIRS = {".kilo"}
+
+def is_always_ignored_relpath(relpath: str) -> bool:
+    """Return True for relative paths excluded from every sync run."""
+    parts = relpath.replace("\\", "/").split("/")
+    return any(part in ALWAYS_IGNORED_DIRS for part in parts)
 
 def load_ignore_set() -> Set[str]:
     """Return the set of absolute paths listed in the ignore file (if it exists)."""
@@ -410,8 +417,8 @@ def preset_ignored_svn_paths(
     }
 
 def build_index(git_root: str, svn_root: str) -> Tuple[Set[str], Set[str]]:
-    git_set = git_ls_files(git_root)
-    svn_set = svn_ls_files(svn_root)
+    git_set = {p for p in git_ls_files(git_root) if not is_always_ignored_relpath(p)}
+    svn_set = {p for p in svn_ls_files(svn_root) if not is_always_ignored_relpath(p)}
     return git_set, svn_set
 
 def compare_and_collect(
@@ -708,8 +715,8 @@ def main():
         )
         sys.exit(1)
 
-    dirty_git = git_uncommitted_files(git_root)
-    dirty_svn = svn_uncommitted_files(svn_root)
+    dirty_git = {p for p in git_uncommitted_files(git_root) if not is_always_ignored_relpath(p)}
+    dirty_svn = {p for p in svn_uncommitted_files(svn_root) if not is_always_ignored_relpath(p)}
     dirty_all = dirty_git.union(dirty_svn)
     if dirty_all:
         print("The following files have uncommitted changes and will be ignored:")

@@ -10,9 +10,10 @@ confirmation.
 
 Before performing any changes the script verifies that both working copies are
 clean and up to date with their remotes. Only version-controlled files are
-considered and paths listed in `~/.git-svn-sync.ignore` are skipped. The script
-supports `-dry-run` to preview actions, `-yes` to auto-approve prompts, and
-`-rebaseline` to populate the ignore file for a new pair of repositories.
+considered, paths listed in `~/.git-svn-sync.ignore` are skipped, and files
+under any `.kilo` directory are always ignored. The script supports `-dry-run`
+to preview actions, `-yes` to auto-approve prompts, and `-rebaseline` to
+populate the ignore file for a new pair of repositories.
 
 ## Usage
 
