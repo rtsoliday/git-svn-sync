@@ -84,6 +84,11 @@ def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> subpro
     """Run a command and return the CompletedProcess. Raises on error if check=True."""
     return subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
 
+def utc_iso_from_epoch(epoch: int) -> str:
+    """Return a UTC ISO-8601 timestamp suitable for Git/SVN date filters."""
+    dt = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -163,33 +168,13 @@ def git_log_messages_since(git_root: str, relpath: str, since_ts: Optional[int])
     try:
         cmd = ["git", "log", "--format=%B%x1e", "--reverse"]
         if since_ts is not None and since_ts >= 0:
-            cmd.insert(2, f"--since={since_ts + 1}")
+            cmd.insert(2, f"--since={utc_iso_from_epoch(since_ts + 1)}")
         cmd.extend(["--", relpath])
         cp = run(cmd, cwd=git_root)
         raw = cp.stdout.split("\x1e")
         return [m.strip() for m in raw if m.strip()]
     except subprocess.CalledProcessError:
         return []
-
-def git_add_commit(git_root: str, relpath: str, message: str, dry_run: bool):
-    if dry_run:
-        print(f"[dry-run] git add -- {relpath}")
-        print(f"[dry-run] git commit -m {message!r} -- {relpath}")
-        print(f"[dry-run] git push origin master")
-        return
-    run(["git", "add", "--", relpath], cwd=git_root)
-    run(["git", "commit", "-m", message, "--", relpath], cwd=git_root)
-    run(["git", "push", "origin", "master"], cwd=git_root)
-
-def git_rm_commit(git_root: str, relpath: str, message: str, dry_run: bool):
-    if dry_run:
-        print(f"[dry-run] git rm -- {relpath}")
-        print(f"[dry-run] git commit -m {message!r} -- {relpath}")
-        print(f"[dry-run] git push origin master")
-        return
-    run(["git", "rm", "--", relpath], cwd=git_root)
-    run(["git", "commit", "-m", message, "--", relpath], cwd=git_root)
-    run(["git", "push", "origin", "master"], cwd=git_root)
 
 def git_is_up_to_date(git_root: str) -> bool:
     """Return True if the Git working copy is up to date with its upstream."""
@@ -318,13 +303,141 @@ def svn_log_messages_since(svn_root: str, relpath: str, since_ts: Optional[int])
     try:
         cmd = ["svn", "log", "--reverse"]
         if since_ts is not None and since_ts >= 0:
-            iso = datetime.datetime.utcfromtimestamp(since_ts + 1).strftime("%Y-%m-%dT%H:%M:%SZ")
-            cmd.extend(["-r", f"{{{iso}}}:HEAD"])
+            cmd.extend(["-r", f"{{{utc_iso_from_epoch(since_ts + 1)}}}:HEAD"])
         cmd.extend(["--", relpath])
         cp = run(cmd, cwd=svn_root)
         return extract_svn_log_messages(cp.stdout)
     except subprocess.CalledProcessError:
         return []
+
+def svn_relative_url(svn_root: str) -> Optional[str]:
+    """Return the repository-relative URL for an SVN working copy root."""
+    try:
+        relative = run(["svn", "info", "--show-item", "relative-url"], cwd=svn_root).stdout.strip()
+    except subprocess.CalledProcessError:
+        relative = ""
+
+    if not relative:
+        try:
+            info = run(["svn", "info"], cwd=svn_root).stdout.splitlines()
+        except subprocess.CalledProcessError:
+            return None
+        url = None
+        repo_root = None
+        for line in info:
+            if line.startswith("Relative URL:"):
+                relative = line.split(":", 1)[1].strip()
+                break
+            if line.startswith("URL:"):
+                url = line.split(":", 1)[1].strip()
+            elif line.startswith("Repository Root:"):
+                repo_root = line.split(":", 1)[1].strip()
+        if not relative and url and repo_root and url.startswith(repo_root):
+            relative = "^/" + url[len(repo_root):].strip("/")
+
+    if relative.startswith("^/"):
+        return relative[2:].strip("/")
+    if relative.startswith("^"):
+        return relative[1:].strip("/")
+    return relative.strip("/") if relative else None
+
+def svn_repo_path_for_relpath(svn_root: str, relpath: str) -> Optional[str]:
+    """Return the absolute repository path SVN verbose logs use for relpath."""
+    root_rel = svn_relative_url(svn_root)
+    if root_rel is None:
+        return None
+    rel = relpath.replace("\\", "/").strip("/")
+    pieces = [p for p in (root_rel, rel) if p]
+    return "/" + "/".join(pieces)
+
+def parse_svn_log_date(date_text: str) -> Optional[int]:
+    """Parse an SVN log header date to epoch seconds."""
+    date_text = date_text.split(" (", 1)[0].strip()
+    try:
+        dt = datetime.datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S %z")
+        return int(dt.timestamp())
+    except ValueError:
+        try:
+            dt = datetime.datetime.fromisoformat(date_text.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+
+def extract_svn_path_change(
+    log_output: str,
+    repo_path: str,
+    actions: Set[str],
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Return metadata for the first verbose SVN log entry touching repo_path."""
+    lines = [l.rstrip("\n") for l in log_output.splitlines()]
+    sep_indices = [i for i, l in enumerate(lines) if l.startswith("-" * 5)]
+    normalized_repo_path = repo_path.rstrip("/")
+
+    for start, end in zip(sep_indices, sep_indices[1:]):
+        if start + 1 >= end:
+            continue
+        header = [part.strip() for part in lines[start + 1].split("|")]
+        if len(header) < 3:
+            continue
+        author = header[1] or None
+        ts = parse_svn_log_date(header[2])
+
+        i = start + 2
+        changed_paths: List[Tuple[str, str]] = []
+        if i < end and lines[i].strip() == "Changed paths:":
+            i += 1
+            while i < end and lines[i].strip():
+                changed = lines[i].strip()
+                parts = changed.split(None, 1)
+                if len(parts) == 2:
+                    action = parts[0][:1]
+                    path = parts[1].split(" (from ", 1)[0].rstrip("/")
+                    changed_paths.append((action, path))
+                i += 1
+
+        message_start = i + 1 if i < end and not lines[i].strip() else i
+        message = "\n".join(lines[message_start:end]).strip()
+        for action, changed_path in changed_paths:
+            if action in actions and changed_path == normalized_repo_path:
+                return ts, message or None, author
+
+    return None, None, None
+
+def svn_deleted_change(
+    svn_root: str,
+    relpath: str,
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Return SVN metadata for the revision that deleted relpath, if found."""
+    repo_path = svn_repo_path_for_relpath(svn_root, relpath)
+    if repo_path is None:
+        return None, None, None
+
+    parent = os.path.dirname(relpath.replace("\\", "/")) or "."
+    anchors = [parent, "."]
+    seen: Set[str] = set()
+    for anchor in anchors:
+        if anchor in seen:
+            continue
+        seen.add(anchor)
+        try:
+            cp = run(["svn", "log", "-v", "--", anchor], cwd=svn_root)
+        except subprocess.CalledProcessError:
+            continue
+        ts, msg, author = extract_svn_path_change(cp.stdout, repo_path, {"D", "R"})
+        if ts is not None or msg is not None or author is not None:
+            return ts, msg, author
+
+    return None, None, None
+
+def svn_last_change_or_deleted(
+    svn_root: str,
+    relpath: str,
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Return last SVN metadata for an existing path, or deletion metadata for a missing path."""
+    ts, msg, author = svn_last_change(svn_root, relpath)
+    if ts is not None or msg is not None or author is not None:
+        return ts, msg, author
+    return svn_deleted_change(svn_root, relpath)
 
 def extract_svn_log_messages(log_output: str) -> List[str]:
     """Parse `svn log` output and return a list of commit messages."""
@@ -346,26 +459,6 @@ def extract_last_svn_log_message(log_output: str) -> str:
         return msgs[0]
     return log_output.strip()
 
-def svn_add_commit(svn_root: str, relpath: str, message: str, dry_run: bool):
-    if dry_run:
-        print(f"[dry-run] svn add -- {relpath}  (if not already versioned)")
-        print(f"[dry-run] svn commit -m {message!r} -- {relpath}")
-        return
-    # Try add; if already versioned, add will fail harmlessly
-    try:
-        run(["svn", "add", "--", relpath], cwd=svn_root, check=False)
-    except Exception:
-        pass
-    run(["svn", "commit", "-m", message, "--", relpath], cwd=svn_root)
-
-def svn_delete_commit(svn_root: str, relpath: str, message: str, dry_run: bool):
-    if dry_run:
-        print(f"[dry-run] svn delete -- {relpath}")
-        print(f"[dry-run] svn commit -m {message!r} -- {relpath}")
-        return
-    run(["svn", "delete", "--", relpath], cwd=svn_root)
-    run(["svn", "commit", "-m", message, "--", relpath], cwd=svn_root)
-
 # ----- Core logic -----
 
 @dataclass
@@ -380,6 +473,14 @@ class FileStatus:
     svn_ts: Optional[int]
     svn_msg: Optional[str]
     svn_author: Optional[str]
+
+
+@dataclass(frozen=True)
+class SyncOperation:
+    relpath: str
+    destination: str  # "git" or "svn"
+    action: str       # "copy" or "delete"
+    message: str
 
 
 @dataclass(frozen=True)
@@ -480,21 +581,102 @@ def copy_file(src_root: str, dst_root: str, relpath: str, dry_run: bool):
         return
     shutil.copy2(src, dst)
 
-def remove_file(root: str, relpath: str, dry_run: bool):
-    path = os.path.join(root, relpath)
-    if dry_run:
-        print(f"[dry-run] remove {path}")
+def grouped_operations(
+    operations: Iterable[SyncOperation],
+) -> List[Tuple[Tuple[str, str], List[SyncOperation]]]:
+    groups: Dict[Tuple[str, str], List[SyncOperation]] = {}
+    for op in operations:
+        groups.setdefault((op.destination, op.message), []).append(op)
+    return list(groups.items())
+
+def execute_operation_groups(
+    operations: Iterable[SyncOperation],
+    git_root: str,
+    svn_root: str,
+    dry_run: bool,
+):
+    groups = grouped_operations(operations)
+    if not groups:
+        print("\nNo approved changes.")
         return
-    if os.path.lexists(path):
-        os.remove(path)
+
+    print(f"\nCommitting {len(groups)} grouped change set(s).")
+    for (destination, message), group in groups:
+        relpaths = sorted({op.relpath for op in group})
+        print(f"\nGROUP: {destination.upper()} commit for {len(relpaths)} file(s)")
+        for relpath in relpaths:
+            print(f"  {relpath}")
+        print(f"  Commit message:\n    {indent_message(message)}")
+
+        if destination == "git":
+            execute_git_group(group, git_root, svn_root, message, dry_run)
+        else:
+            execute_svn_group(group, git_root, svn_root, message, dry_run)
+
+def execute_git_group(
+    operations: List[SyncOperation],
+    git_root: str,
+    svn_root: str,
+    message: str,
+    dry_run: bool,
+):
+    copy_paths = sorted(op.relpath for op in operations if op.action == "copy")
+    delete_paths = sorted(op.relpath for op in operations if op.action == "delete")
+    commit_paths = sorted(set(copy_paths + delete_paths))
+
+    for relpath in copy_paths:
+        copy_file(svn_root, git_root, relpath, dry_run)
+
+    if dry_run:
+        if copy_paths:
+            print(f"[dry-run] git add -- {' '.join(copy_paths)}")
+        if delete_paths:
+            print(f"[dry-run] git rm -- {' '.join(delete_paths)}")
+        print(f"[dry-run] git commit -m {message!r} -- {' '.join(commit_paths)}")
+        print(f"[dry-run] git push origin master")
+        return
+
+    if copy_paths:
+        run(["git", "add", "--", *copy_paths], cwd=git_root)
+    if delete_paths:
+        run(["git", "rm", "--", *delete_paths], cwd=git_root)
+    run(["git", "commit", "-m", message, "--", *commit_paths], cwd=git_root)
+    run(["git", "push", "origin", "master"], cwd=git_root)
+
+def execute_svn_group(
+    operations: List[SyncOperation],
+    git_root: str,
+    svn_root: str,
+    message: str,
+    dry_run: bool,
+):
+    copy_paths = sorted(op.relpath for op in operations if op.action == "copy")
+    delete_paths = sorted(op.relpath for op in operations if op.action == "delete")
+    commit_paths = sorted(set(copy_paths + delete_paths))
+
+    for relpath in copy_paths:
+        copy_file(git_root, svn_root, relpath, dry_run)
+
+    if dry_run:
+        for relpath in copy_paths:
+            print(f"[dry-run] svn add -- {relpath}  (if not already versioned)")
+        if delete_paths:
+            print(f"[dry-run] svn delete -- {' '.join(delete_paths)}")
+        print(f"[dry-run] svn commit -m {message!r} -- {' '.join(commit_paths)}")
+        return
+
+    for relpath in copy_paths:
+        run(["svn", "add", "--", relpath], cwd=svn_root, check=False)
+    if delete_paths:
+        run(["svn", "delete", "--", *delete_paths], cwd=svn_root)
+    run(["svn", "commit", "-m", message, "--", *commit_paths], cwd=svn_root)
 
 def handle_mismatch(
     st: FileStatus,
     git_root: str,
     svn_root: str,
-    auto_yes: bool,
-    dry_run: bool
-):
+    auto_yes: bool
+) -> Optional[SyncOperation]:
     rel = st.relpath
     # Decide newer side
     git_ts = st.git_ts or -1
@@ -502,7 +684,7 @@ def handle_mismatch(
 
     if git_ts == -1 and svn_ts == -1:
         print(f"?? {rel}: content differs but no commit timestamps could be read. Skipping.")
-        return
+        return None
 
     newer = "git" if git_ts >= svn_ts else "svn"
     older = "svn" if newer == "git" else "git"
@@ -522,28 +704,24 @@ def handle_mismatch(
     author_str = f" by {newer_author}" if newer_author else ""
     print(f"  Commit message(s) ({newer.upper()}{author_str}):\n    {indent_message(combined_msg)}")
 
-    if prompt_yes_no(f"Sync {rel}? Copy {newer.upper()} -> {older.upper()} and commit with that message.", default_yes=True, auto_yes=auto_yes):
+    if prompt_yes_no(f"Sync {rel}? Queue copy {newer.upper()} -> {older.upper()} with that message.", default_yes=True, auto_yes=auto_yes):
         if newer == "git":
-            # Copy git -> svn, then commit in SVN
-            copy_file(git_root, svn_root, rel, dry_run)
             commit_msg = augment_message(combined_msg or f"Sync {rel} from Git", newer_author)
-            svn_add_commit(svn_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "svn", "copy", commit_msg)
         else:
-            # Copy svn -> git, then commit in Git
-            copy_file(svn_root, git_root, rel, dry_run)
             commit_msg = augment_message(combined_msg or f"Sync {rel} from SVN", newer_author)
-            git_add_commit(git_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "git", "copy", commit_msg)
     else:
         print("  Skipped.")
+    return None
 
 def handle_only_in_one(
     rel: str,
     present_in: str,   # "git" or "svn"
     git_root: str,
     svn_root: str,
-    auto_yes: bool,
-    dry_run: bool
-):
+    auto_yes: bool
+) -> Optional[SyncOperation]:
     other = "svn" if present_in == "git" else "git"
     print(f"\nONLY IN {present_in.upper()}: {rel}")
 
@@ -555,33 +733,28 @@ def handle_only_in_one(
 
     if present_in == "git":
         if do_add:
-            # Add to SVN
-            copy_file(git_root, svn_root, rel, dry_run)
             # Use the file's commit messages from Git if available, else a generic message
             ts, last_msg, author = git_last_change(git_root, rel)
             msgs = git_log_messages_since(git_root, rel, None)
             combined = "\n\n".join(msgs) if msgs else last_msg
             commit_msg = augment_message(combined or f"Add {rel} (synced from Git)", author)
-            svn_add_commit(svn_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "svn", "copy", commit_msg)
         else:
-            # Remove from Git
-            ts, msg, author = git_last_change(git_root, rel)
+            ts, msg, author = svn_last_change_or_deleted(svn_root, rel)
             commit_msg = augment_message(msg or f"Remove {rel} (not present in SVN)", author)
-            git_rm_commit(git_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "git", "delete", commit_msg)
     else:
         if do_add:
-            # Add to Git
-            copy_file(svn_root, git_root, rel, dry_run)
             ts, last_msg, author = svn_last_change(svn_root, rel)
             msgs = svn_log_messages_since(svn_root, rel, None)
             combined = "\n\n".join(msgs) if msgs else last_msg
             commit_msg = augment_message(combined or f"Add {rel} (synced from SVN)", author)
-            git_add_commit(git_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "git", "copy", commit_msg)
         else:
-            # Remove from SVN
-            ts, msg, author = svn_last_change(svn_root, rel)
+            ts, msg, author = git_last_change(git_root, rel)
             commit_msg = augment_message(msg or f"Remove {rel} (not present in Git)", author)
-            svn_delete_commit(svn_root, rel, commit_msg, dry_run)
+            return SyncOperation(rel, "svn", "delete", commit_msg)
+    return None
 
 def indent_message(msg: Optional[str]) -> str:
     if not msg:
@@ -816,17 +989,27 @@ def main():
     print(f"  Only in Git: {len(only_git)}")
     print(f"  Only in SVN: {len(only_svn)}")
 
+    operations: List[SyncOperation] = []
+
     # Mismatched content
     for s in diffs:
-        handle_mismatch(s, git_root, svn_root, auto_yes, dry_run)
+        op = handle_mismatch(s, git_root, svn_root, auto_yes)
+        if op:
+            operations.append(op)
 
     # Only in Git
     for rel in only_git:
-        handle_only_in_one(rel, "git", git_root, svn_root, auto_yes, dry_run)
+        op = handle_only_in_one(rel, "git", git_root, svn_root, auto_yes)
+        if op:
+            operations.append(op)
 
     # Only in SVN
     for rel in only_svn:
-        handle_only_in_one(rel, "svn", git_root, svn_root, auto_yes, dry_run)
+        op = handle_only_in_one(rel, "svn", git_root, svn_root, auto_yes)
+        if op:
+            operations.append(op)
+
+    execute_operation_groups(operations, git_root, svn_root, dry_run)
 
     print("\nDone.")
 

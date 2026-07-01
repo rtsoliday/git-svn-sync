@@ -5,6 +5,8 @@
 compares their contents using SHA-256 checksums and timestamps, and
 interactively copies newer files over the older ones. When copying, the script
 replays the original commit message and author in the destination repository.
+Approved changes with the same final commit message are grouped into a single
+commit per destination repository instead of being committed one file at a time.
 Files that exist only in one working copy can be added or removed after
 confirmation.
 
