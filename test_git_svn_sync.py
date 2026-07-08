@@ -63,6 +63,64 @@ class CommitMessageTests(unittest.TestCase):
             ),
         )
 
+    def test_mismatches_group_by_latest_git_message_not_stale_file_history(self):
+        statuses = [
+            sync.FileStatus(
+                "a.txt",
+                True,
+                True,
+                False,
+                200,
+                "latest git commit",
+                "git-user",
+                100,
+                "old svn message for a",
+                "svn-user",
+            ),
+            sync.FileStatus(
+                "b.txt",
+                True,
+                True,
+                False,
+                200,
+                "latest git commit",
+                "git-user",
+                50,
+                "old svn message for b",
+                "svn-user",
+            ),
+        ]
+
+        with patch.object(sync, "prompt_yes_no", return_value=True), \
+             patch.object(sync, "git_log_messages_since", side_effect=AssertionError("stale history should not be queried")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                operations = [
+                    sync.handle_mismatch(status, "/git", "/svn", False)
+                    for status in statuses
+                ]
+
+        self.assertEqual(
+            operations,
+            [
+                sync.SyncOperation(
+                    "a.txt",
+                    "svn",
+                    "copy",
+                    "latest git commit\n\nOriginal author: git-user",
+                ),
+                sync.SyncOperation(
+                    "b.txt",
+                    "svn",
+                    "copy",
+                    "latest git commit\n\nOriginal author: git-user",
+                ),
+            ],
+        )
+        groups = sync.grouped_operations(op for op in operations if op is not None)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], ("svn", "latest git commit\n\nOriginal author: git-user"))
+        self.assertEqual({op.relpath for op in groups[0][1]}, {"a.txt", "b.txt"})
+
     def test_extract_svn_deleted_path_change_from_verbose_log(self):
         log_output = """------------------------------------------------------------------------
 r12 | svn-user | 2025-01-02 03:04:05 +0000 (Thu, 02 Jan 2025) | 1 line

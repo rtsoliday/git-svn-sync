@@ -693,23 +693,19 @@ def handle_mismatch(
     newer_msg = st.git_msg if newer == "git" else st.svn_msg
     newer_author = st.git_author if newer == "git" else st.svn_author
 
-    if newer == "git":
-        msgs = git_log_messages_since(git_root, rel, older_ts)
-    else:
-        msgs = svn_log_messages_since(svn_root, rel, older_ts)
-    combined_msg = "\n\n".join(msgs) if msgs else newer_msg
+    commit_msg_base = newer_msg
 
     print(f"\nDIFF: {rel}")
     print(f"  Last change: {newer.upper()} is newer ({newer_ts}), {older.upper()} older ({older_ts})")
     author_str = f" by {newer_author}" if newer_author else ""
-    print(f"  Commit message(s) ({newer.upper()}{author_str}):\n    {indent_message(combined_msg)}")
+    print(f"  Commit message ({newer.upper()}{author_str}):\n    {indent_message(commit_msg_base)}")
 
     if prompt_yes_no(f"Sync {rel}? Queue copy {newer.upper()} -> {older.upper()} with that message.", default_yes=True, auto_yes=auto_yes):
         if newer == "git":
-            commit_msg = augment_message(combined_msg or f"Sync {rel} from Git", newer_author)
+            commit_msg = augment_message(commit_msg_base or f"Sync {rel} from Git", newer_author)
             return SyncOperation(rel, "svn", "copy", commit_msg)
         else:
-            commit_msg = augment_message(combined_msg or f"Sync {rel} from SVN", newer_author)
+            commit_msg = augment_message(commit_msg_base or f"Sync {rel} from SVN", newer_author)
             return SyncOperation(rel, "git", "copy", commit_msg)
     else:
         print("  Skipped.")
