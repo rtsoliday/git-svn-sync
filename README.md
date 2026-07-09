@@ -14,14 +14,42 @@ Before performing any changes the script verifies that both working copies are
 clean and up to date with their remotes. Only version-controlled files are
 considered, paths listed in `~/.git-svn-sync.ignore` are skipped, and files
 under any `.kilo` directory are always ignored. The script supports `-dry-run`
-to preview actions, `-yes` to auto-approve prompts, and `-rebaseline` to
-populate the ignore file for a new pair of repositories.
+to preview actions without copying, staging, committing, pushing, or writing the
+ignore file, `-yes` to auto-approve prompts, and `-rebaseline` to populate the
+ignore file for a new pair of repositories.
 
 ## Usage
 
 ```
 python git-svn-sync.py -git /path/to/git_wc -svn /path/to/svn_wc [-yes] [-dry-run] [-rebaseline]
 ```
+
+## GUI
+
+Run without command-line options to open the Tkinter GUI:
+
+```
+python git-svn-sync.py
+```
+
+You can also start the GUI directly with `python git_svn_sync_gui.py`. The GUI
+lets you choose a preset or interactively set manual Git/SVN working-copy paths
+with text fields and Browse buttons, scan for differences, review and select
+planned operations, run selected operations, run rebaseline, and update the SVN
+working copy. Dry run is enabled by default in the GUI. The lower log pane shows
+the underlying Git/SVN commands and file operations with stdout, stderr, exit
+codes, and dry-run/planned markers.
+
+The `Update SVN` button first runs `svn status`. If tracked local changes are
+found, it refuses to run `svn update` and reports the blocking paths. Untracked
+`?` entries and external `X` entries are ignored for this safety check. If the
+status is otherwise clean, it runs `svn update` and logs the command output.
+When Scan detects that SVN needs an update, the error popup includes an
+`Update SVN` button for the same safe workflow.
+
+The GUI uses the same sync core as the command-line interface. Discovery
+commands still run in dry-run mode so the plan is based on repository state, but
+dry-run skips `git fetch` and reports that remote freshness was not refreshed.
 
 In addition to passing explicit paths, several preset options are provided for
 common repository pairs:

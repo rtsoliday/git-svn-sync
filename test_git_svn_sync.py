@@ -1,17 +1,12 @@
 import contextlib
 import io
-import importlib.util
 import subprocess
+import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 
-MODULE_PATH = Path(__file__).with_name("git-svn-sync.py")
-SPEC = importlib.util.spec_from_file_location("git_svn_sync", MODULE_PATH)
-sync = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(sync)
+import git_svn_sync as sync
 
 
 class CommitMessageTests(unittest.TestCase):
@@ -183,6 +178,291 @@ deleted in svn
             [call for call in calls if call[0][:2] == ["svn", "commit"]],
             [(["svn", "commit", "-m", "shared message", "--", "a.txt", "b.txt"], "/svn", True)],
         )
+
+    def test_run_reports_command_event_with_output_and_dry_run_status(self):
+        reporter = sync.CollectingReporter()
+
+        with sync.workflow_context(reporter, True):
+            cp = sync.run([sys.executable, "-c", "print('hello')"])
+
+        self.assertEqual(cp.returncode, 0)
+        self.assertEqual(len(reporter.commands), 1)
+        event = reporter.commands[0]
+        self.assertEqual(event.cmd[:2], (sys.executable, "-c"))
+        self.assertEqual(event.stdout, "hello\n")
+        self.assertEqual(event.stderr, "")
+        self.assertEqual(event.returncode, 0)
+        self.assertTrue(event.dry_run)
+        self.assertFalse(event.planned)
+
+    def test_dry_run_execute_git_group_emits_planned_events_without_running_commands(self):
+        reporter = sync.CollectingReporter()
+        operations = [
+            sync.SyncOperation("copy.txt", "git", "copy", "shared message"),
+            sync.SyncOperation("delete.txt", "git", "delete", "shared message"),
+        ]
+
+        with patch.object(sync, "run", side_effect=AssertionError("dry-run should not execute write commands")):
+            with sync.workflow_context(reporter, True):
+                sync.execute_operation_groups(operations, "/git", "/svn", True)
+
+        planned = [event.cmd for event in reporter.commands if event.planned]
+        self.assertIn(("git", "add", "--", "copy.txt"), planned)
+        self.assertIn(("git", "rm", "--", "delete.txt"), planned)
+        self.assertIn(("git", "commit", "-m", "shared message", "--", "copy.txt", "delete.txt"), planned)
+        self.assertIn(("git", "push", "origin", "master"), planned)
+        self.assertTrue(all(event.dry_run for event in reporter.commands))
+        self.assertTrue(all(event.planned for event in reporter.commands))
+        self.assertTrue(all(event.dry_run for event in reporter.file_operations))
+        self.assertTrue(all(event.planned for event in reporter.file_operations))
+
+    def test_git_dry_run_up_to_date_check_skips_fetch(self):
+        calls = []
+        reporter = sync.CollectingReporter()
+
+        def fake_run(cmd, cwd=None, check=True, reporter=None, dry_run=None):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="same\n", stderr="")
+
+        with patch.object(sync, "run", fake_run):
+            with sync.workflow_context(reporter, True):
+                self.assertTrue(sync.git_is_up_to_date("/git", refresh=False))
+
+        self.assertNotIn(["git", "fetch"], calls)
+        self.assertIn(["git", "rev-parse", "HEAD"], calls)
+        self.assertIn(["git", "rev-parse", "@{u}"], calls)
+        self.assertTrue(
+            any("Skipping git fetch" in message for _stream, message in reporter.messages)
+        )
+
+    def test_rebaseline_dry_run_previews_without_writing_ignore_file(self):
+        reporter = sync.CollectingReporter()
+        plan = sync.SyncPlan(
+            sync.SyncConfig("/git", "/svn", dry_run=True, rebaseline=True),
+            None,
+            0,
+            0,
+            (),
+            (),
+            (),
+            (),
+            (),
+            ("/git/new.txt",),
+            (),
+        )
+
+        with patch.object(sync, "append_to_ignore", side_effect=AssertionError("dry-run should not write ignore file")):
+            added = sync.apply_rebaseline_plan(plan, reporter)
+
+        self.assertEqual(added, ["/git/new.txt"])
+        self.assertTrue(
+            any("would add /git/new.txt" in message for _stream, message in reporter.messages)
+        )
+
+    def test_safe_svn_update_runs_update_when_status_is_clean(self):
+        calls = []
+        reporter = sync.CollectingReporter()
+
+        def fake_run(cmd, cwd=None, check=True, reporter=None, dry_run=None):
+            calls.append((cmd, cwd))
+            if cmd == ["svn", "status"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd == ["svn", "update"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="Updated to revision 10.\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(sync, "run", fake_run):
+            sync.safe_svn_update("/svn", reporter)
+
+        self.assertEqual(
+            calls,
+            [
+                (["svn", "info"], "/svn"),
+                (["svn", "status"], "/svn"),
+                (["svn", "update"], "/svn"),
+            ],
+        )
+        self.assertTrue(
+            any("SVN update complete" in message for _stream, message in reporter.messages)
+        )
+
+    def test_safe_svn_update_refuses_when_status_has_local_changes(self):
+        calls = []
+        reporter = sync.CollectingReporter()
+
+        def fake_run(cmd, cwd=None, check=True, reporter=None, dry_run=None):
+            calls.append((cmd, cwd))
+            if cmd == ["svn", "status"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="M       changed.txt\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(sync, "run", fake_run):
+            with self.assertRaises(sync.SyncError) as cm:
+                sync.safe_svn_update("/svn", reporter)
+
+        self.assertNotIn((["svn", "update"], "/svn"), calls)
+        self.assertIn("changed.txt", str(cm.exception))
+        self.assertTrue(
+            any("Refusing to run svn update" in message for _stream, message in reporter.messages)
+        )
+
+    def test_safe_svn_update_ignores_untracked_status_lines(self):
+        calls = []
+        reporter = sync.CollectingReporter()
+
+        def fake_run(cmd, cwd=None, check=True, reporter=None, dry_run=None):
+            calls.append((cmd, cwd))
+            if cmd == ["svn", "status"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="?       .codex\n?       bin\n?       build/O.Linux-x86_64\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(sync, "run", fake_run):
+            sync.safe_svn_update("/svn", reporter)
+
+        self.assertIn((["svn", "update"], "/svn"), calls)
+        self.assertTrue(
+            any("SVN update complete" in message for _stream, message in reporter.messages)
+        )
+
+    def test_safe_svn_update_ignores_external_status_lines(self):
+        calls = []
+        reporter = sync.CollectingReporter()
+
+        def fake_run(cmd, cwd=None, check=True, reporter=None, dry_run=None):
+            calls.append((cmd, cwd))
+            if cmd == ["svn", "status"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="X       external-lib\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(sync, "run", fake_run):
+            sync.safe_svn_update("/svn", reporter)
+
+        self.assertIn((["svn", "update"], "/svn"), calls)
+
+    def test_gui_row_model_selects_default_and_alternate_operations(self):
+        import git_svn_sync_gui as gui
+
+        status = sync.FileStatus(
+            "new.txt",
+            True,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        add_op = sync.SyncOperation(
+            "new.txt",
+            "svn",
+            "copy",
+            "Add file\n\nOriginal author: user",
+        )
+        remove_op = sync.SyncOperation("new.txt", "git", "delete", "Remove file")
+        item = sync.PlanItem("new.txt", "only_git", status, add_op, remove_op)
+        row = gui.GuiPlanRow(item)
+
+        self.assertEqual(gui.row_values(row)[2], "copy to SVN")
+        self.assertEqual(gui.row_values(row)[4], "user")
+        self.assertEqual(gui.selected_operations([row]), [add_op])
+
+        row.use_alternate = True
+        self.assertEqual(gui.row_values(row)[2], "delete from GIT")
+        self.assertEqual(gui.selected_operations([row]), [remove_op])
+
+        row.selected = False
+        self.assertEqual(gui.selected_operations([row]), [])
+
+    def test_gui_routes_svn_update_error_to_custom_dialog(self):
+        import git_svn_sync_gui as gui
+
+        class FakeStatusVar:
+            def __init__(self):
+                self.values = []
+
+            def set(self, value):
+                self.values.append(value)
+
+        app = gui.GitSvnSyncApp.__new__(gui.GitSvnSyncApp)
+        app.busy = True
+        app.status_var = FakeStatusVar()
+        logged = []
+        dialogs = []
+        app._append_log = lambda text: logged.append(text)
+        app._show_svn_update_error = lambda message: dialogs.append(message)
+
+        with patch.object(gui.messagebox, "showerror", side_effect=AssertionError("should use custom dialog")):
+            app._handle_event((
+                "error",
+                "Error: SVN working copy is not up to date.\nPlease run 'svn update' before running this script.",
+            ))
+
+        self.assertFalse(app.busy)
+        self.assertEqual(app.status_var.values, ["Error"])
+        self.assertEqual(len(dialogs), 1)
+        self.assertIn("svn update", dialogs[0])
+        self.assertTrue(any("ERROR:" in text for text in logged))
+
+    def test_gui_routes_other_errors_to_standard_dialog(self):
+        import git_svn_sync_gui as gui
+
+        class FakeStatusVar:
+            def __init__(self):
+                self.values = []
+
+            def set(self, value):
+                self.values.append(value)
+
+        app = gui.GitSvnSyncApp.__new__(gui.GitSvnSyncApp)
+        app.busy = True
+        app.status_var = FakeStatusVar()
+        logged = []
+        shown = []
+        app._append_log = lambda text: logged.append(text)
+        app._show_svn_update_error = lambda message: (_ for _ in ()).throw(
+            AssertionError("should not use custom dialog")
+        )
+
+        with patch.object(gui.messagebox, "showerror", side_effect=lambda title, message: shown.append((title, message))):
+            app._handle_event(("error", "plain failure"))
+
+        self.assertFalse(app.busy)
+        self.assertEqual(app.status_var.values, ["Error"])
+        self.assertEqual(shown, [("git-svn-sync", "plain failure")])
+        self.assertTrue(any("ERROR:" in text for text in logged))
+
+    def test_main_without_arguments_launches_gui(self):
+        launched = []
+
+        with patch.object(sync, "launch_gui", side_effect=lambda: launched.append(True)):
+            sync.main([])
+
+        self.assertEqual(launched, [True])
+
+    def test_main_with_help_stays_in_cli_parser(self):
+        with patch.object(sync, "launch_gui", side_effect=AssertionError("help should not launch GUI")):
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    sync.main(["-h"])
+
+        self.assertEqual(cm.exception.code, 0)
 
 
 if __name__ == "__main__":
