@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import subprocess
 import sys
 import unittest
@@ -58,7 +59,7 @@ class CommitMessageTests(unittest.TestCase):
             ),
         )
 
-    def test_mismatches_group_by_latest_git_message_not_stale_file_history(self):
+    def test_mismatches_group_when_full_git_history_messages_match(self):
         statuses = [
             sync.FileStatus(
                 "a.txt",
@@ -86,14 +87,21 @@ class CommitMessageTests(unittest.TestCase):
             ),
         ]
 
+        history_cutoffs = []
+
+        def git_history(_root, _relpath, since_ts):
+            history_cutoffs.append(since_ts)
+            return ["latest git commit"]
+
         with patch.object(sync, "prompt_yes_no", return_value=True), \
-             patch.object(sync, "git_log_messages_since", side_effect=AssertionError("stale history should not be queried")):
+             patch.object(sync, "git_log_messages_since", side_effect=git_history):
             with contextlib.redirect_stdout(io.StringIO()):
                 operations = [
                     sync.handle_mismatch(status, "/git", "/svn", False)
                     for status in statuses
                 ]
 
+        self.assertEqual(history_cutoffs, [100, 50])
         self.assertEqual(
             operations,
             [
@@ -172,8 +180,17 @@ deleted in svn
             copies,
             [("/git", "/svn", "a.txt", False), ("/git", "/svn", "b.txt", False)],
         )
-        self.assertIn((["svn", "add", "--", "a.txt"], "/svn", False), calls)
-        self.assertIn((["svn", "add", "--", "b.txt"], "/svn", False), calls)
+        self.assertIn(
+            (
+                [
+                    "svn", "add", "--parents", "--force", "--",
+                    "a.txt", "b.txt",
+                ],
+                "/svn",
+                True,
+            ),
+            calls,
+        )
         self.assertEqual(
             [call for call in calls if call[0][:2] == ["svn", "commit"]],
             [(["svn", "commit", "-m", "shared message", "--", "a.txt", "b.txt"], "/svn", True)],
@@ -194,6 +211,38 @@ deleted in svn
         self.assertEqual(event.returncode, 0)
         self.assertTrue(event.dry_run)
         self.assertFalse(event.planned)
+
+    def test_gui_askpass_context_detaches_terminal_and_sets_helpers(self):
+        completed = subprocess.CompletedProcess(["git", "fetch"], 0, "", "")
+
+        with patch.object(sync.subprocess, "run", return_value=completed) as run_process:
+            with sync.gui_askpass_context():
+                sync.run(["git", "fetch"], cwd="/git")
+
+        kwargs = run_process.call_args.kwargs
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["env"]["GIT_ASKPASS"], os.path.abspath(sync.__file__))
+        self.assertEqual(kwargs["env"]["SSH_ASKPASS"], os.path.abspath(sync.__file__))
+        self.assertEqual(kwargs["env"]["SSH_ASKPASS_REQUIRE"], "force")
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_cli_run_keeps_normal_terminal_authentication(self):
+        completed = subprocess.CompletedProcess(["git", "fetch"], 0, "", "")
+
+        with patch.object(sync.subprocess, "run", return_value=completed) as run_process:
+            sync.run(["git", "fetch"], cwd="/git")
+
+        kwargs = run_process.call_args.kwargs
+        self.assertIsNone(kwargs["stdin"])
+        self.assertIsNone(kwargs["env"])
+
+    def test_askpass_invocation_routes_prompt_to_dialog(self):
+        with patch.dict(os.environ, {sync.ASKPASS_ENV: "1"}), \
+             patch.object(sync, "show_askpass_dialog", return_value=7) as dialog:
+            result = sync.main(["Password for repository:"])
+
+        self.assertEqual(result, 7)
+        dialog.assert_called_once_with("Password for repository:")
 
     def test_dry_run_execute_git_group_emits_planned_events_without_running_commands(self):
         reporter = sync.CollectingReporter()
@@ -355,7 +404,7 @@ deleted in svn
         self.assertIn((["svn", "update"], "/svn"), calls)
 
     def test_gui_row_model_selects_default_and_alternate_operations(self):
-        import git_svn_sync_gui as gui
+        gui = sync
 
         status = sync.FileStatus(
             "new.txt",
@@ -379,19 +428,19 @@ deleted in svn
         item = sync.PlanItem("new.txt", "only_git", status, add_op, remove_op)
         row = gui.GuiPlanRow(item)
 
-        self.assertEqual(gui.row_values(row)[2], "copy to SVN")
+        self.assertEqual(gui.row_values(row)[2], "GIT → SVN")
         self.assertEqual(gui.row_values(row)[4], "user")
         self.assertEqual(gui.selected_operations([row]), [add_op])
 
         row.use_alternate = True
-        self.assertEqual(gui.row_values(row)[2], "delete from GIT")
+        self.assertEqual(gui.row_values(row)[2], "Delete from GIT")
         self.assertEqual(gui.selected_operations([row]), [remove_op])
 
         row.selected = False
         self.assertEqual(gui.selected_operations([row]), [])
 
     def test_gui_routes_svn_update_error_to_custom_dialog(self):
-        import git_svn_sync_gui as gui
+        gui = sync
 
         class FakeStatusVar:
             def __init__(self):
@@ -421,7 +470,7 @@ deleted in svn
         self.assertTrue(any("ERROR:" in text for text in logged))
 
     def test_gui_routes_other_errors_to_standard_dialog(self):
-        import git_svn_sync_gui as gui
+        gui = sync
 
         class FakeStatusVar:
             def __init__(self):

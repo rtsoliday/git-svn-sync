@@ -155,6 +155,8 @@ class SyncError(RuntimeError):
 
 _ACTIVE_REPORTER: Optional[CommandReporter] = None
 _ACTIVE_DRY_RUN = False
+_GUI_ASKPASS_ACTIVE = False
+ASKPASS_ENV = "GIT_SVN_SYNC_ASKPASS"
 
 
 @contextlib.contextmanager
@@ -180,6 +182,56 @@ def active_reporter(reporter: Optional[CommandReporter] = None) -> Optional[Comm
 
 def active_dry_run(dry_run: Optional[bool] = None) -> bool:
     return _ACTIVE_DRY_RUN if dry_run is None else dry_run
+
+
+@contextlib.contextmanager
+def gui_askpass_context() -> Iterator[None]:
+    """Route Git/SSH authentication prompts to a GUI-owned dialog."""
+    global _GUI_ASKPASS_ACTIVE
+    previous = _GUI_ASKPASS_ACTIVE
+    _GUI_ASKPASS_ACTIVE = True
+    try:
+        yield
+    finally:
+        _GUI_ASKPASS_ACTIVE = previous
+
+
+def askpass_environment() -> Dict[str, str]:
+    """Return an environment that makes this script the Git/SSH askpass app."""
+    env = os.environ.copy()
+    script = os.path.abspath(__file__)
+    env.update({
+        ASKPASS_ENV: "1",
+        "GIT_ASKPASS": script,
+        "GIT_TERMINAL_PROMPT": "0",
+        "SSH_ASKPASS": script,
+        "SSH_ASKPASS_REQUIRE": "force",
+    })
+    # OpenSSH requires DISPLAY to be present even when the askpass program is
+    # a native Tk window. macOS GUI applications commonly have no DISPLAY.
+    env.setdefault("DISPLAY", ":0")
+    return env
+
+
+def show_askpass_dialog(prompt: str) -> int:
+    """Display a foreground password prompt and print its answer for askpass."""
+    from tkinter import simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes("-topmost", True)
+    root.update_idletasks()
+    answer = simpledialog.askstring(
+        "Authentication Required",
+        prompt or "Password:",
+        show="*",
+        parent=root,
+    )
+    root.destroy()
+    if answer is None:
+        return 1
+    print(answer)
+    return 0
 
 
 def emit_message(
@@ -290,6 +342,8 @@ def run(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL if _GUI_ASKPASS_ACTIVE else None,
+            env=askpass_environment() if _GUI_ASKPASS_ACTIVE else None,
             check=False,
         )
     except FileNotFoundError as exc:
@@ -2853,7 +2907,8 @@ class GitSvnSyncApp:
     def _run_worker(self, target) -> None:
         def wrapped() -> None:
             try:
-                target()
+                with sync.gui_askpass_context():
+                    target()
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
@@ -3167,6 +3222,8 @@ def launch_gui() -> None:
 def main(argv: Optional[List[str]] = None):
     if argv is None:
         argv = sys.argv[1:]
+    if os.environ.get(ASKPASS_ENV) == "1":
+        return show_askpass_dialog(argv[0] if argv else "Password:")
     if not argv:
         launch_gui()
         return

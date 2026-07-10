@@ -32,13 +32,12 @@ Run without command-line options to open the Tkinter GUI:
 python git-svn-sync.py
 ```
 
-You can also start the GUI directly with `python git_svn_sync_gui.py`. The GUI
-lets you choose a preset or interactively set manual Git/SVN working-copy paths
-with text fields and Browse buttons, scan for differences, review and select
-planned operations, run selected operations, run rebaseline, and update the SVN
-working copy. Dry run is enabled by default in the GUI. The lower log pane shows
-the underlying Git/SVN commands and file operations with stdout, stderr, exit
-codes, and dry-run/planned markers.
+The GUI lets you choose a preset or interactively set manual Git/SVN
+working-copy paths with text fields and Browse buttons, scan for differences,
+review and select planned operations, run selected operations, run rebaseline,
+and update the SVN working copy. Dry run is enabled by default in the GUI. The
+lower log pane shows the underlying Git/SVN commands and file operations with
+stdout, stderr, exit codes, and dry-run/planned markers.
 
 The `Update SVN` button first runs `svn status`. If tracked local changes are
 found, it refuses to run `svn update` and reports the blocking paths. Untracked
@@ -50,6 +49,9 @@ When Scan detects that SVN needs an update, the error popup includes an
 The GUI uses the same sync core as the command-line interface. Discovery
 commands still run in dry-run mode so the plan is based on repository state, but
 dry-run skips `git fetch` and reports that remote freshness was not refreshed.
+Git and SSH authentication requested by GUI-launched commands is shown in a
+foreground password dialog instead of the terminal that launched the GUI. CLI
+runs retain their normal terminal authentication behavior.
 
 In addition to passing explicit paths, several preset options are provided for
 common repository pairs:
