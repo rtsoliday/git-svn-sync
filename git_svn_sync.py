@@ -37,16 +37,24 @@ Safety:
 """
 
 import argparse
+import dataclasses
 import hashlib
 import datetime
 import contextlib
 import os
+import queue
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, ttk
 
 # Path to ignore file containing newline-separated absolute paths to ignore
 IGNORE_FILE = os.path.expanduser("~/.git-svn-sync.ignore")
@@ -432,6 +440,61 @@ def git_uncommitted_files(git_root: str) -> Set[str]:
             files.add(line[3:])
     return files
 
+
+def git_local_status_entries(git_root: str) -> List[str]:
+    """Return tracked Git status lines that should block an automatic pull."""
+    cp = run(["git", "status", "--porcelain"], cwd=git_root)
+    return [
+        line
+        for line in cp.stdout.splitlines()
+        if line.strip() and not line.startswith("??") and line[:2].strip()
+    ]
+
+
+def resolve_git_root(config: "SyncConfig") -> str:
+    preset = PRESETS.get(config.preset_name or "")
+    if config.preset_name and preset is None:
+        raise ValueError(f"Unknown preset: {config.preset_name}")
+    git_root_raw = preset.git_root if preset else config.git_root
+    if not git_root_raw:
+        raise ValueError("Must specify a Git path or a preset")
+    return os.path.abspath(os.path.expanduser(git_root_raw))
+
+
+def safe_git_update(
+    git_root: str,
+    reporter: Optional[CommandReporter] = None,
+) -> None:
+    """Fast-forward pull only when Git has no tracked working-copy changes."""
+    with workflow_context(reporter, False):
+        try:
+            run(["git", "rev-parse", "--is-inside-work-tree"], cwd=git_root)
+        except subprocess.CalledProcessError as e:
+            raise SyncError(f"Error: Git probe failed in {git_root}:\n{e.stderr}") from e
+        except FileNotFoundError as e:
+            raise SyncError("Error: Required tool for Git not found on PATH.") from e
+
+        local_entries = git_local_status_entries(git_root)
+        if local_entries:
+            emit_message("Refusing to update Git because tracked local changes were found:")
+            for line in local_entries:
+                emit_message(f"  {line}")
+            raise SyncError(
+                "Refusing to update Git because tracked local changes were found:\n"
+                + "\n".join(f"  {line}" for line in local_entries)
+            )
+
+        emit_message("No tracked local Git changes detected. Running fast-forward-only pull...")
+        run(["git", "pull", "--ff-only"], cwd=git_root)
+        emit_message("Git update complete.")
+
+
+def safe_git_update_from_config(
+    config: "SyncConfig",
+    reporter: Optional[CommandReporter] = None,
+) -> None:
+    safe_git_update(resolve_git_root(config), reporter=reporter)
+
 # ----- SVN helpers -----
 
 def svn_is_up_to_date(svn_root: str) -> bool:
@@ -514,18 +577,46 @@ def safe_svn_update_from_config(
 
 def svn_ls_files(svn_root: str) -> Set[str]:
     """
-    List versioned files in an SVN working copy by calling `svn list -R`.
-    This returns repository entries relative to the given path.
+    List versioned files from the local SVN working-copy metadata.
+
+    Unlike ``svn list -R``, this does not contact the repository server.
     """
-    cp = run(["svn", "list", "-R", "."], cwd=svn_root)
-    files: Set[str] = set()
-    for line in cp.stdout.splitlines():
-        line = line.strip()
-        if not line or line.endswith("/"):
-            # Directories (svn list outputs directories with trailing slash)
+    return set(svn_file_metadata(svn_root))
+
+
+def svn_file_metadata(
+    svn_root: str,
+) -> Dict[str, Tuple[Optional[int], Optional[str]]]:
+    """Return local ``path -> (last-change timestamp, author)`` SVN metadata.
+
+    A single recursive ``svn info --xml`` replaces both the remote recursive
+    listing and two per-file ``svn info`` subprocesses used during comparison.
+    """
+    cp = run(["svn", "info", "--xml", "--depth", "infinity", "."], cwd=svn_root)
+    root = ET.fromstring(cp.stdout)
+    metadata: Dict[str, Tuple[Optional[int], Optional[str]]] = {}
+    for entry in root.findall("entry"):
+        if entry.get("kind") != "file":
             continue
-        files.add(line)
-    return files
+        relpath = (entry.get("path") or "").replace(os.sep, "/")
+        if not relpath or relpath == ".":
+            continue
+        commit = entry.find("commit")
+        author: Optional[str] = None
+        timestamp: Optional[int] = None
+        if commit is not None:
+            author = (commit.findtext("author") or "").strip() or None
+            date_text = (commit.findtext("date") or "").strip()
+            if date_text:
+                try:
+                    changed_at = datetime.datetime.fromisoformat(
+                        date_text.replace("Z", "+00:00")
+                    )
+                    timestamp = int(changed_at.timestamp())
+                except ValueError:
+                    pass
+        metadata[relpath] = (timestamp, author)
+    return metadata
 
 def svn_last_change(
     svn_root: str, relpath: str
@@ -591,14 +682,100 @@ def svn_log_messages_since(svn_root: str, relpath: str, since_ts: Optional[int])
     returned.
     """
     try:
-        cmd = ["svn", "log", "--reverse"]
+        cmd = ["svn", "log", "--xml"]
         if since_ts is not None and since_ts >= 0:
-            cmd.extend(["-r", f"{{{utc_iso_from_epoch(since_ts + 1)}}}:HEAD"])
+            # An SVN date resolves to the youngest repository revision at or
+            # before that time, so the response can contain one older entry.
+            # Query from the cutoff itself and filter exact entry timestamps
+            # below instead of relying on date-to-revision rounding.
+            cmd.extend(["-r", f"{{{utc_iso_from_epoch(since_ts)}}}:HEAD"])
+        else:
+            cmd.extend(["-r", "1:HEAD"])
         cmd.extend(["--", relpath])
         cp = run(cmd, cwd=svn_root)
-        return extract_svn_log_messages(cp.stdout)
-    except subprocess.CalledProcessError:
+        root = ET.fromstring(cp.stdout)
+        messages: List[str] = []
+        for entry in root.findall("logentry"):
+            if since_ts is not None and since_ts >= 0:
+                date_text = entry.findtext("date") or ""
+                try:
+                    changed_at = datetime.datetime.fromisoformat(
+                        date_text.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    continue
+                if changed_at <= since_ts:
+                    continue
+            message = (entry.findtext("msg") or "").strip()
+            if message:
+                messages.append(message)
+        return messages
+    except (subprocess.CalledProcessError, ET.ParseError):
         return []
+
+
+def svn_log_messages_since_many(
+    svn_root: str,
+    cutoffs: Dict[str, int],
+) -> Dict[str, List[str]]:
+    """Return per-file SVN messages with one remote history request.
+
+    SVN accepts multiple paths when they follow a repository URL. Verbose XML
+    identifies the exact changed paths in each returned revision, allowing the
+    combined response to be distributed back to individual files.
+    """
+    if not cutoffs:
+        return {}
+
+    results = {relpath: [] for relpath in cutoffs}
+    root_rel = svn_relative_url(svn_root)
+    if root_rel is None:
+        return results
+
+    nonnegative_cutoffs = [cutoff for cutoff in cutoffs.values() if cutoff >= 0]
+    if len(nonnegative_cutoffs) == len(cutoffs):
+        earliest = min(nonnegative_cutoffs)
+        revision_range = f"{{{utc_iso_from_epoch(earliest)}}}:HEAD"
+    else:
+        revision_range = "1:HEAD"
+
+    base_url = f"^/{root_rel}" if root_rel else "^/"
+    relpaths = sorted(cutoffs)
+    cmd = [
+        "svn", "log", "--xml", "-v", "-r", revision_range,
+        "--", base_url, *relpaths,
+    ]
+    try:
+        cp = run(cmd, cwd=svn_root)
+        root = ET.fromstring(cp.stdout)
+    except (subprocess.CalledProcessError, ET.ParseError):
+        return results
+
+    repo_prefix = f"/{root_rel.strip('/')}" if root_rel else ""
+    repo_paths = {
+        f"{repo_prefix}/{relpath.replace(os.sep, '/').lstrip('/')}": relpath
+        for relpath in relpaths
+    }
+    for entry in root.findall("logentry"):
+        date_text = entry.findtext("date") or ""
+        try:
+            changed_at = datetime.datetime.fromisoformat(
+                date_text.replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            continue
+        message = (entry.findtext("msg") or "").strip()
+        if not message:
+            continue
+        changed_repo_paths = {
+            (path.text or "").rstrip("/")
+            for path in entry.findall("./paths/path")
+        }
+        for repo_path in changed_repo_paths:
+            relpath = repo_paths.get(repo_path)
+            if relpath is not None and changed_at > cutoffs[relpath]:
+                results[relpath].append(message)
+    return results
 
 def svn_relative_url(svn_root: str) -> Optional[str]:
     """Return the repository-relative URL for an SVN working copy root."""
@@ -911,7 +1088,10 @@ def compare_and_collect(
     git_root: str,
     svn_root: str,
     git_set: Set[str],
-    svn_set: Set[str]
+    svn_set: Set[str],
+    svn_metadata: Optional[
+        Dict[str, Tuple[Optional[int], Optional[str]]]
+    ] = None,
 ) -> Dict[str, FileStatus]:
     all_paths = sorted(git_set.union(svn_set))
     status: Dict[str, FileStatus] = {}
@@ -935,7 +1115,16 @@ def compare_and_collect(
 
             if not same:
                 git_ts, git_msg, git_author = git_last_change(git_root, rel)
-                svn_ts, svn_msg, svn_author = svn_last_change(svn_root, rel)
+                if svn_metadata is not None and rel in svn_metadata:
+                    svn_ts, svn_author = svn_metadata[rel]
+                    # The message is loaded with the source history only if SVN
+                    # proves newer. Avoiding an unconditional remote log lookup
+                    # here is the main Scan performance improvement.
+                    svn_msg = None
+                else:
+                    svn_ts, svn_msg, svn_author = svn_last_change(svn_root, rel)
+        elif in_svn and svn_metadata is not None and rel in svn_metadata:
+            svn_ts, svn_author = svn_metadata[rel]
 
         status[rel] = FileStatus(
             relpath=rel,
@@ -1063,10 +1252,10 @@ def execute_svn_group(
         copy_file(git_root, svn_root, relpath, dry_run)
 
     if dry_run:
-        for relpath in copy_paths:
-            cmd = ["svn", "add", "--", relpath]
+        if copy_paths:
+            cmd = ["svn", "add", "--parents", "--force", "--", *copy_paths]
             emit_message(
-                f"[dry-run] {format_command(cmd)}  (if not already versioned)"
+                f"[dry-run] {format_command(cmd)}"
             )
             emit_command_event(cmd, svn_root, dry_run=True, planned=True)
         if delete_paths:
@@ -1083,8 +1272,36 @@ def execute_svn_group(
         emit_command_event(cmd, svn_root, dry_run=True, planned=True)
         return
 
-    for relpath in copy_paths:
-        run(["svn", "add", "--", relpath], cwd=svn_root, check=False)
+    if copy_paths:
+        # --force makes already-versioned files a no-op, while --parents stages
+        # any missing directories needed by genuinely new files.
+        run(
+            ["svn", "add", "--parents", "--force", "--", *copy_paths],
+            cwd=svn_root,
+        )
+
+        # SVN will not commit a newly added file unless its newly added parent
+        # directories are also explicit commit targets.  Limit the status
+        # query to parents of this group's files so unrelated working-copy
+        # changes can never expand the commit scope.
+        parent_paths: Set[str] = set()
+        for relpath in copy_paths:
+            parent = os.path.dirname(relpath)
+            while parent:
+                parent_paths.add(parent)
+                parent = os.path.dirname(parent)
+        if parent_paths:
+            ordered_parents = sorted(parent_paths)
+            cp = run(
+                ["svn", "status", "--depth", "empty", "--", *ordered_parents],
+                cwd=svn_root,
+            )
+            added_parents = {
+                line[8:].strip()
+                for line in cp.stdout.splitlines()
+                if line and line[0] == "A"
+            }
+            commit_paths = sorted(set(commit_paths).union(added_parents))
     if delete_paths:
         for relpath in delete_paths:
             emit_file_operation(
@@ -1112,20 +1329,48 @@ def mismatch_sides(
     return newer, older, newer_ts, older_ts, newer_msg, newer_author
 
 
-def operation_for_mismatch(st: FileStatus) -> Optional[SyncOperation]:
+def operation_for_mismatch(
+    st: FileStatus,
+    git_root: Optional[str] = None,
+    svn_root: Optional[str] = None,
+    history_messages: Optional[List[str]] = None,
+) -> Optional[SyncOperation]:
+    """Build a copy operation using all source commits after the older change.
+
+    The last change on the destination side is the best cross-VCS baseline
+    available because Git and SVN do not share revision identifiers.  Keep the
+    optional roots for backwards compatibility with callers that only need the
+    latest-message behavior.
+    """
     sides = mismatch_sides(st)
     if sides is None:
         return None
-    newer, older, _newer_ts, _older_ts, newer_msg, newer_author = sides
+    newer, older, _newer_ts, older_ts, newer_msg, newer_author = sides
+
+    messages: List[str] = []
     if newer == "git":
-        commit_msg = augment_message(
-            newer_msg or f"Sync {st.relpath} from Git", newer_author
-        )
-        return SyncOperation(st.relpath, "svn", "copy", commit_msg)
-    commit_msg = augment_message(
-        newer_msg or f"Sync {st.relpath} from SVN", newer_author
+        if history_messages is not None:
+            messages = history_messages
+        elif git_root is not None:
+            messages = git_log_messages_since(git_root, st.relpath, older_ts)
+        fallback = newer_msg or f"Sync {st.relpath} from Git"
+        destination = "svn"
+    else:
+        if history_messages is not None:
+            messages = history_messages
+        elif svn_root is not None:
+            messages = svn_log_messages_since(svn_root, st.relpath, older_ts)
+        fallback = newer_msg or f"Sync {st.relpath} from SVN"
+        destination = "git"
+
+    combined = "\n\n".join(messages) if messages else fallback
+    commit_msg = augment_message(combined, newer_author)
+    return SyncOperation(
+        st.relpath,
+        destination,
+        "copy",
+        commit_msg,
     )
-    return SyncOperation(st.relpath, "git", "copy", commit_msg)
 
 
 def add_operation_for_only(
@@ -1145,6 +1390,32 @@ def add_operation_for_only(
     combined = "\n\n".join(msgs) if msgs else last_msg
     commit_msg = augment_message(combined or f"Add {rel} (synced from SVN)", author)
     return SyncOperation(rel, "git", "copy", commit_msg)
+
+
+def preview_add_operation_for_only(
+    st: FileStatus,
+    present_in: str,
+    git_root: str,
+) -> SyncOperation:
+    """Build a fast Scan-time add operation without remote history reads."""
+    rel = st.relpath
+    if present_in == "git":
+        _ts, latest_message, author = git_last_change(git_root, rel)
+        commit_msg = augment_message(
+            latest_message or f"Add {rel} (synced from Git)", author
+        )
+        return SyncOperation(rel, "svn", "copy", commit_msg)
+    commit_msg = augment_message(
+        st.svn_msg or f"Add {rel} (synced from SVN)", st.svn_author
+    )
+    return SyncOperation(rel, "git", "copy", commit_msg)
+
+
+def preview_remove_operation_for_only(rel: str, present_in: str) -> SyncOperation:
+    """Build a Scan-time removal preview without repository history reads."""
+    if present_in == "git":
+        return SyncOperation(rel, "git", "delete", f"Remove {rel} (not present in SVN)")
+    return SyncOperation(rel, "svn", "delete", f"Remove {rel} (not present in Git)")
 
 
 def remove_operation_for_only(
@@ -1177,16 +1448,21 @@ def handle_mismatch(
         )
         return None
 
-    newer, older, newer_ts, older_ts, newer_msg, newer_author = sides
-    commit_msg_base = newer_msg
+    newer, older, newer_ts, older_ts, _newer_msg, newer_author = sides
+    operation = operation_for_mismatch(st, git_root, svn_root)
+    if operation is None:
+        return None
 
     emit_message(f"\nDIFF: {rel}")
     emit_message(f"  Last change: {newer.upper()} is newer ({newer_ts}), {older.upper()} older ({older_ts})")
     author_str = f" by {newer_author}" if newer_author else ""
-    emit_message(f"  Commit message ({newer.upper()}{author_str}):\n    {indent_message(commit_msg_base)}")
+    emit_message(
+        f"  Commit message(s) since the last {older.upper()} change "
+        f"({newer.upper()}{author_str}):\n    {indent_message(operation.message)}"
+    )
 
-    if prompt_yes_no(f"Sync {rel}? Queue copy {newer.upper()} -> {older.upper()} with that message.", default_yes=True, auto_yes=auto_yes):
-        return operation_for_mismatch(st)
+    if prompt_yes_no(f"Sync {rel}? Queue copy {newer.upper()} -> {older.upper()} with those messages.", default_yes=True, auto_yes=auto_yes):
+        return operation
     else:
         emit_message("  Skipped.")
     return None
@@ -1240,6 +1516,8 @@ def build_plan_items(
     items: List[PlanItem] = []
     for st in status.values():
         if st.in_git and st.in_svn and st.same_content is False:
+            # Full history is intentionally deferred until execution. Scan only
+            # needs direction, latest metadata, and a useful preview message.
             op = operation_for_mismatch(st)
             note = "" if op else "No Git or SVN timestamp could be read."
             items.append(PlanItem(st.relpath, "diff", st, op, None, note))
@@ -1249,8 +1527,8 @@ def build_plan_items(
                     st.relpath,
                     "only_git",
                     st,
-                    add_operation_for_only(st.relpath, "git", git_root, svn_root),
-                    remove_operation_for_only(st.relpath, "git", git_root, svn_root),
+                    preview_add_operation_for_only(st, "git", git_root),
+                    preview_remove_operation_for_only(st.relpath, "git"),
                 )
             )
         elif st.in_svn and not st.in_git:
@@ -1259,8 +1537,8 @@ def build_plan_items(
                     st.relpath,
                     "only_svn",
                     st,
-                    add_operation_for_only(st.relpath, "svn", git_root, svn_root),
-                    remove_operation_for_only(st.relpath, "svn", git_root, svn_root),
+                    preview_add_operation_for_only(st, "svn", git_root),
+                    preview_remove_operation_for_only(st.relpath, "svn"),
                 )
             )
     return tuple(items)
@@ -1325,7 +1603,15 @@ def prepare_sync_plan(
             emit_message("No uncommitted changes detected.")
 
         emit_message("Indexing versioned files...")
-        git_set, svn_set = build_index(git_root, svn_root)
+        git_set = {
+            p for p in git_ls_files(git_root)
+            if not is_always_ignored_relpath(p)
+        }
+        svn_metadata = {
+            p: info for p, info in svn_file_metadata(svn_root).items()
+            if not is_always_ignored_relpath(p)
+        }
+        svn_set = set(svn_metadata)
         git_tracked_count = len(git_set)
         svn_tracked_count = len(svn_set)
 
@@ -1418,7 +1704,13 @@ def prepare_sync_plan(
                 placeholders,
             )
 
-        status = compare_and_collect(git_root, svn_root, git_set, svn_set)
+        status = compare_and_collect(
+            git_root,
+            svn_root,
+            git_set,
+            svn_set,
+            svn_metadata=svn_metadata,
+        )
         return SyncPlan(
             resolved_config,
             chosen_preset,
@@ -1516,14 +1808,111 @@ def choose_operations_from_plan(plan: SyncPlan) -> List[SyncOperation]:
     return operations
 
 
+def hydrate_operation_messages(
+    plan: SyncPlan,
+    operations: Iterable[SyncOperation],
+) -> List[SyncOperation]:
+    """Load full source histories for selected copy operations at run time."""
+    selected = list(operations)
+    items_by_path = {item.relpath: item for item in plan.items}
+    svn_cutoffs: Dict[str, int] = {}
+    for operation in selected:
+        if operation.action != "copy" or operation.destination != "git":
+            continue
+        item = items_by_path.get(operation.relpath)
+        if item is None:
+            continue
+        if item.kind == "diff":
+            sides = mismatch_sides(item.status)
+            if sides is not None and sides[0] == "svn":
+                svn_cutoffs[operation.relpath] = sides[3]
+        elif item.kind == "only_svn":
+            svn_cutoffs[operation.relpath] = -1
+
+    if any(operation.action == "copy" for operation in selected):
+        emit_message("Loading complete commit history for selected files...")
+    svn_histories = svn_log_messages_since_many(
+        plan.config.svn_root or "", svn_cutoffs
+    )
+
+    hydrated: List[SyncOperation] = []
+    for operation in selected:
+        if operation.action != "copy":
+            item = items_by_path.get(operation.relpath)
+            if item is not None and item.kind in ("only_git", "only_svn"):
+                present_in = "git" if item.kind == "only_git" else "svn"
+                hydrated.append(
+                    remove_operation_for_only(
+                        operation.relpath,
+                        present_in,
+                        plan.config.git_root or "",
+                        plan.config.svn_root or "",
+                    )
+                )
+            else:
+                hydrated.append(operation)
+            continue
+        item = items_by_path.get(operation.relpath)
+        if item is None:
+            hydrated.append(operation)
+            continue
+
+        st = item.status
+        if item.kind == "diff":
+            sides = mismatch_sides(st)
+            prefetched = (
+                svn_histories.get(operation.relpath, [])
+                if sides is not None and sides[0] == "svn"
+                else None
+            )
+            full_operation = operation_for_mismatch(
+                st,
+                plan.config.git_root,
+                plan.config.svn_root,
+                history_messages=prefetched,
+            )
+            hydrated.append(full_operation or operation)
+            continue
+
+        if item.kind == "only_git":
+            hydrated.append(
+                add_operation_for_only(
+                    operation.relpath,
+                    "git",
+                    plan.config.git_root or "",
+                    plan.config.svn_root or "",
+                )
+            )
+            continue
+
+        if item.kind == "only_svn":
+            messages = svn_histories.get(operation.relpath, [])
+            combined = "\n\n".join(messages) if messages else (
+                st.svn_msg or f"Add {operation.relpath} (synced from SVN)"
+            )
+            hydrated.append(
+                SyncOperation(
+                    operation.relpath,
+                    "git",
+                    "copy",
+                    augment_message(combined, st.svn_author),
+                )
+            )
+            continue
+
+        hydrated.append(operation)
+    return hydrated
+
+
 def execute_plan_operations(
     plan: SyncPlan,
     operations: Iterable[SyncOperation],
     reporter: Optional[CommandReporter] = None,
 ) -> None:
     with workflow_context(reporter, plan.config.dry_run):
+        operations_with_history = hydrate_operation_messages(plan, operations)
         execute_operation_groups(
-            operations,
+            operations_with_history,
             plan.config.git_root or "",
             plan.config.svn_root or "",
             plan.config.dry_run,
@@ -1548,10 +1937,1231 @@ def run_sync(
     return plan
 
 
-def launch_gui() -> None:
-    import git_svn_sync_gui
+# Self-alias keeps the consolidated GUI implementation compatible with the
+# former git_svn_sync_gui module's qualified references.
+sync = sys.modules[__name__]
 
-    git_svn_sync_gui.main()
+MANUAL_PRESET_LABEL = "Manual paths"
+SVN_UPDATE_HINT = "Please run 'svn update'"
+GIT_UPDATE_HINT = "Please run 'git pull"
+FILTER_ALL = "all"
+FILTER_DIFF = "diff"
+FILTER_ONLY_GIT = "only_git"
+FILTER_ONLY_SVN = "only_svn"
+
+COLORS = {
+    "background": "#F4F7FB",
+    "surface": "#FFFFFF",
+    "surface_muted": "#F8FAFC",
+    "border": "#DCE3EC",
+    "text": "#172033",
+    "muted": "#64748B",
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "success": "#16A34A",
+    "success_hover": "#15803D",
+    "warning": "#D97706",
+    "selection": "#DBEAFE",
+    "console": "#111827",
+    "console_text": "#D1D5DB",
+}
+
+
+@dataclass
+class GuiPlanRow:
+    item: sync.PlanItem
+    selected: bool = True
+    use_alternate: bool = False
+
+    @property
+    def operation(self) -> Optional[sync.SyncOperation]:
+        if self.use_alternate and self.item.alternate_operation:
+            return self.item.alternate_operation
+        return self.item.suggested_operation
+
+
+def operation_label(operation: Optional[sync.SyncOperation]) -> str:
+    if operation is None:
+        return "Skip"
+    if operation.action == "copy":
+        source = "SVN" if operation.destination == "git" else "GIT"
+        return f"{source} → {operation.destination.upper()}"
+    return f"Delete from {operation.destination.upper()}"
+
+
+def operation_author(operation: Optional[sync.SyncOperation]) -> str:
+    if operation is None:
+        return ""
+    marker = "\nOriginal author: "
+    if marker in operation.message:
+        return operation.message.rsplit(marker, 1)[1].strip()
+    return ""
+
+
+def operation_summary(operation: Optional[sync.SyncOperation]) -> str:
+    if operation is None or not operation.message:
+        return ""
+    return operation.message.splitlines()[0]
+
+
+def row_values(row: GuiPlanRow) -> tuple:
+    operation = row.operation
+    status = {
+        "diff": "Different",
+        "only_git": "Only in Git",
+        "only_svn": "Only in SVN",
+    }.get(row.item.kind, row.item.kind)
+    return (
+        "[x]" if row.selected else "[ ]",
+        status,
+        operation_label(operation),
+        row.item.relpath,
+        operation_author(operation),
+        operation_summary(operation),
+    )
+
+
+def selected_operations(rows: Iterable[GuiPlanRow]) -> List[sync.SyncOperation]:
+    operations: List[sync.SyncOperation] = []
+    for row in rows:
+        if row.selected and row.operation:
+            operations.append(row.operation)
+    return operations
+
+
+def row_matches_filter(
+    row: GuiPlanRow,
+    filter_name: str,
+    query: str,
+) -> bool:
+    """Return whether a row belongs in the current results view."""
+    if filter_name != FILTER_ALL and row.item.kind != filter_name:
+        return False
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return True
+    operation = row.operation
+    searchable = "\n".join((
+        row.item.relpath,
+        operation_label(operation),
+        operation_author(operation),
+        operation.message if operation else "",
+    )).casefold()
+    return normalized_query in searchable
+
+
+def is_svn_update_required_error(message: str) -> bool:
+    return SVN_UPDATE_HINT in message
+
+
+def is_git_update_required_error(message: str) -> bool:
+    return GIT_UPDATE_HINT in message
+
+
+def message_needs_tooltip(
+    full_message: str,
+    displayed_message: str,
+    cell_width: int,
+    measure_text: Callable[[str], int],
+    horizontal_padding: int = 12,
+) -> bool:
+    """Return whether a Message cell hides any of its underlying text."""
+    if not full_message or not displayed_message:
+        return False
+    if full_message.strip() != displayed_message.strip():
+        return True
+    available_width = max(0, cell_width - horizontal_padding)
+    return measure_text(displayed_message) > available_width
+
+
+class TkQueueReporter(sync.CommandReporter):
+    def __init__(self, events: "queue.Queue[tuple]"):
+        self.events = events
+
+    def message(self, text: str, stream: str = "stdout") -> None:
+        self.events.put(("message", stream, text))
+
+    def command(self, event: sync.CommandEvent) -> None:
+        self.events.put(("command", event))
+
+    def file_operation(self, event: sync.FileOperationEvent) -> None:
+        self.events.put(("file_operation", event))
+
+
+class ScanCommandReporter(sync.CommandReporter):
+    """Report only command lines while a Scan is running."""
+
+    def __init__(self, events: "queue.Queue[tuple]"):
+        self.events = events
+
+    def message(self, text: str, stream: str = "stdout") -> None:
+        pass
+
+    def command(self, event: sync.CommandEvent) -> None:
+        self.events.put((
+            "command",
+            dataclasses.replace(event, stdout="", stderr="", returncode=None),
+        ))
+
+    def file_operation(self, event: sync.FileOperationEvent) -> None:
+        pass
+
+
+class TreeMessageTooltip:
+    """Show complete Message text when a Treeview cell cannot show it all."""
+
+    def __init__(
+        self,
+        tree: ttk.Treeview,
+        message_for_item: Callable[[str], str],
+        delay_ms: int = 500,
+    ):
+        self.tree = tree
+        self.message_for_item = message_for_item
+        self.delay_ms = delay_ms
+        self.after_id: Optional[str] = None
+        self.window: Optional[tk.Toplevel] = None
+        self.candidate: Optional[tuple] = None
+
+        columns = list(tree.cget("columns"))
+        self.message_column = "message"
+        self.message_column_number = f"#{columns.index(self.message_column) + 1}"
+        font_spec = ttk.Style(tree).lookup("Treeview", "font") or "TkDefaultFont"
+        try:
+            self.font = tkfont.nametofont(font_spec)
+        except tk.TclError:
+            self.font = tkfont.Font(font=font_spec)
+
+        tree.bind("<Motion>", self._on_motion, add="+")
+        tree.bind("<Leave>", self.hide, add="+")
+        tree.bind("<ButtonPress>", self.hide, add="+")
+        tree.bind("<MouseWheel>", self.hide, add="+")
+        tree.bind("<Configure>", self.hide, add="+")
+
+    def _on_motion(self, event) -> None:
+        if (
+            self.tree.identify_region(event.x, event.y) != "cell"
+            or self.tree.identify_column(event.x) != self.message_column_number
+        ):
+            self.hide()
+            return
+
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            self.hide()
+            return
+        bbox = self.tree.bbox(item_id, self.message_column)
+        if not bbox:
+            self.hide()
+            return
+        displayed = str(self.tree.set(item_id, self.message_column))
+        full_message = self.message_for_item(item_id)
+        if not message_needs_tooltip(
+            full_message, displayed, bbox[2], self.font.measure
+        ):
+            self.hide()
+            return
+
+        candidate = (item_id, displayed, full_message)
+        if candidate == self.candidate:
+            return
+        self.hide()
+        self.candidate = candidate
+        self.after_id = self.tree.after(
+            self.delay_ms,
+            lambda: self._show(candidate, event.x_root + 12, event.y_root + 16),
+        )
+
+    def _show(self, candidate: tuple, x: int, y: int) -> None:
+        self.after_id = None
+        if candidate != self.candidate or not self.tree.winfo_exists():
+            return
+        full_message = candidate[2]
+        self.window = tk.Toplevel(self.tree)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_attributes("-topmost", True)
+        label = tk.Label(
+            self.window,
+            text=full_message,
+            justify="left",
+            anchor="w",
+            background="#ffffe0",
+            foreground="#000000",
+            relief="solid",
+            borderwidth=1,
+            padx=6,
+            pady=4,
+            wraplength=640,
+        )
+        label.pack()
+        self.window.update_idletasks()
+        width = self.window.winfo_reqwidth()
+        height = self.window.winfo_reqheight()
+        x = min(x, max(0, self.window.winfo_screenwidth() - width - 4))
+        if y + height > self.window.winfo_screenheight():
+            y = max(0, y - height - 28)
+        self.window.wm_geometry(f"+{x}+{y}")
+
+    def hide(self, _event=None) -> None:
+        if self.after_id is not None:
+            self.tree.after_cancel(self.after_id)
+            self.after_id = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+        self.candidate = None
+
+
+class GitSvnSyncApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Git ↔ SVN Sync")
+        self.root.geometry("1240x820")
+        self.root.minsize(980, 660)
+        self.root.configure(background=COLORS["background"])
+        self.root.option_add("*tearOff", False)
+
+        self.events: "queue.Queue[tuple]" = queue.Queue()
+        self.reporter = TkQueueReporter(self.events)
+        self.current_plan: Optional[sync.SyncPlan] = None
+        self.rows: List[GuiPlanRow] = []
+        self.busy = False
+        self.activity_expanded = True
+        self.activity_sash_position: Optional[int] = None
+
+        self.preset_var = tk.StringVar(value=MANUAL_PRESET_LABEL)
+        self.git_var = tk.StringVar()
+        self.svn_var = tk.StringVar()
+        self.dry_run_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Ready to scan")
+        self.filter_var = tk.StringVar(value=FILTER_ALL)
+        self.search_var = tk.StringVar()
+        self.all_filter_text = tk.StringVar(value="All  0")
+        self.diff_filter_text = tk.StringVar(value="Different  0")
+        self.git_filter_text = tk.StringVar(value="Only Git  0")
+        self.svn_filter_text = tk.StringVar(value="Only SVN  0")
+        self.results_title_var = tk.StringVar(value="Changes")
+        self.selection_var = tk.StringVar(value="No changes selected")
+
+        self._configure_styles()
+        self._build_ui()
+        self.search_var.trace_add("write", lambda *_args: self._reload_tree())
+        self.dry_run_var.trace_add("write", lambda *_args: self._refresh_action_states())
+        self._refresh_action_states()
+        self._poll_events()
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("App.TFrame", background=COLORS["background"])
+        style.configure(
+            "Card.TFrame",
+            background=COLORS["surface"],
+            borderwidth=1,
+            relief="solid",
+            bordercolor=COLORS["border"],
+        )
+        style.configure("App.TLabel", background=COLORS["background"], foreground=COLORS["text"])
+        style.configure("Card.TLabel", background=COLORS["surface"], foreground=COLORS["text"])
+        style.configure(
+            "Title.App.TLabel",
+            background=COLORS["background"],
+            foreground=COLORS["text"],
+            font=("TkDefaultFont", 19, "bold"),
+        )
+        style.configure(
+            "Subtitle.App.TLabel",
+            background=COLORS["background"],
+            foreground=COLORS["muted"],
+            font=("TkDefaultFont", 10),
+        )
+        style.configure(
+            "Section.Card.TLabel",
+            background=COLORS["surface"],
+            foreground=COLORS["text"],
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        style.configure(
+            "Muted.Card.TLabel",
+            background=COLORS["surface"],
+            foreground=COLORS["muted"],
+        )
+        style.configure(
+            "GitChip.Card.TLabel",
+            background="#DBEAFE",
+            foreground="#1D4ED8",
+            font=("TkDefaultFont", 9, "bold"),
+            padding=(8, 4),
+        )
+        style.configure(
+            "SvnChip.Card.TLabel",
+            background="#EDE9FE",
+            foreground="#6D28D9",
+            font=("TkDefaultFont", 9, "bold"),
+            padding=(8, 4),
+        )
+        style.configure(
+            "DryRun.TCheckbutton",
+            background=COLORS["background"],
+            foreground=COLORS["warning"],
+            font=("TkDefaultFont", 9, "bold"),
+            padding=(10, 6),
+        )
+        style.map("DryRun.TCheckbutton", background=[("active", COLORS["background"])])
+
+        for name, color, hover in (
+            ("Primary", COLORS["primary"], COLORS["primary_hover"]),
+            ("Success", COLORS["success"], COLORS["success_hover"]),
+        ):
+            style.configure(
+                f"{name}.TButton",
+                background=color,
+                foreground="#FFFFFF",
+                borderwidth=0,
+                focusthickness=0,
+                padding=(16, 9),
+                font=("TkDefaultFont", 10, "bold"),
+            )
+            style.map(
+                f"{name}.TButton",
+                background=[("active", hover), ("disabled", "#AAB6C5")],
+                foreground=[("disabled", "#EEF2F7")],
+            )
+        style.configure(
+            "Secondary.TButton",
+            background=COLORS["surface_muted"],
+            foreground=COLORS["text"],
+            borderwidth=1,
+            bordercolor=COLORS["border"],
+            padding=(13, 8),
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", "#E8EEF6"), ("disabled", "#F1F5F9")],
+            foreground=[("disabled", "#94A3B8")],
+        )
+        style.configure(
+            "Ghost.TButton",
+            background=COLORS["surface"],
+            foreground=COLORS["muted"],
+            borderwidth=0,
+            padding=(9, 6),
+        )
+        style.map("Ghost.TButton", background=[("active", COLORS["surface_muted"])])
+        style.configure(
+            "Filter.Toolbutton",
+            background=COLORS["surface"],
+            foreground=COLORS["muted"],
+            borderwidth=1,
+            bordercolor=COLORS["border"],
+            padding=(11, 6),
+        )
+        style.map(
+            "Filter.Toolbutton",
+            background=[("selected", COLORS["selection"]), ("active", COLORS["surface_muted"])],
+            foreground=[("selected", COLORS["primary"])],
+        )
+        style.configure(
+            "Modern.TEntry",
+            fieldbackground=COLORS["surface"],
+            foreground=COLORS["text"],
+            bordercolor=COLORS["border"],
+            lightcolor=COLORS["border"],
+            darkcolor=COLORS["border"],
+            padding=7,
+        )
+        style.configure(
+            "Modern.TCombobox",
+            fieldbackground=COLORS["surface"],
+            foreground=COLORS["text"],
+            bordercolor=COLORS["border"],
+            padding=6,
+        )
+        style.configure(
+            "Modern.Treeview",
+            background=COLORS["surface"],
+            fieldbackground=COLORS["surface"],
+            foreground=COLORS["text"],
+            borderwidth=0,
+            rowheight=34,
+            font=("TkDefaultFont", 10),
+        )
+        style.map(
+            "Modern.Treeview",
+            background=[("selected", COLORS["selection"])],
+            foreground=[("selected", COLORS["text"])],
+        )
+        style.configure(
+            "Modern.Treeview.Heading",
+            background=COLORS["surface_muted"],
+            foreground="#475569",
+            borderwidth=0,
+            relief="flat",
+            padding=(8, 9),
+            font=("TkDefaultFont", 9, "bold"),
+        )
+        style.map("Modern.Treeview.Heading", background=[("active", "#EEF2F7")])
+        style.configure(
+            "Modern.Horizontal.TProgressbar",
+            background=COLORS["primary"],
+            troughcolor=COLORS["border"],
+            borderwidth=0,
+            thickness=3,
+        )
+
+    def _build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self.shell = ttk.Frame(
+            self.root, style="App.TFrame", padding=(18, 14, 18, 16)
+        )
+        self.shell.grid(row=0, column=0, sticky="nsew")
+        self.shell.columnconfigure(0, weight=1)
+        self.shell.rowconfigure(2, weight=1)
+
+        self._build_header()
+        self._build_repository_card()
+        self.content_pane = tk.PanedWindow(
+            self.shell,
+            orient=tk.VERTICAL,
+            background="#CBD5E1",
+            borderwidth=0,
+            relief="flat",
+            sashwidth=7,
+            sashrelief="flat",
+            showhandle=True,
+            handlesize=12,
+            handlepad=10,
+            opaqueresize=True,
+        )
+        self.content_pane.grid(row=2, column=0, sticky="nsew")
+        self._build_results_card()
+        self._build_activity_card()
+        self.root.after_idle(self._set_initial_panel_ratio)
+
+    def _build_header(self) -> None:
+        header = ttk.Frame(self.shell, style="App.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Git ↔ SVN Sync", style="Title.App.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text="Review and synchronize changes between working copies",
+            style="Subtitle.App.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.dry_run_toggle = ttk.Checkbutton(
+            header,
+            text="DRY RUN",
+            variable=self.dry_run_var,
+            style="DryRun.TCheckbutton",
+        )
+        self.dry_run_toggle.grid(row=0, column=1, rowspan=2, sticky="e")
+
+    def _build_repository_card(self) -> None:
+        card = ttk.Frame(self.shell, style="Card.TFrame", padding=(18, 14))
+        card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=1)
+        ttk.Label(card, text="Repository pair", style="Section.Card.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(
+            card,
+            text="Choose a preset or enter two working-copy paths",
+            style="Muted.Card.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 10))
+
+        ttk.Label(card, text="Preset", style="Muted.Card.TLabel").grid(
+            row=0, column=2, sticky="e", padx=(12, 8)
+        )
+        preset_values = [MANUAL_PRESET_LABEL] + list(sync.PRESETS.keys())
+        self.preset = ttk.Combobox(
+            card,
+            textvariable=self.preset_var,
+            values=preset_values,
+            state="readonly",
+            width=20,
+            style="Modern.TCombobox",
+        )
+        self.preset.grid(row=0, column=3, sticky="e")
+        self.preset.bind("<<ComboboxSelected>>", self._on_preset_changed)
+
+        ttk.Label(card, text="GIT", style="GitChip.Card.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(0, 7)
+        )
+        self.git_entry = ttk.Entry(card, textvariable=self.git_var, style="Modern.TEntry")
+        self.git_entry.grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(10, 8), pady=(0, 7)
+        )
+        self.git_browse_button = ttk.Button(
+            card,
+            text="Browse",
+            command=lambda: self._browse(self.git_var),
+            style="Secondary.TButton",
+        )
+        self.git_browse_button.grid(row=2, column=3, sticky="e", pady=(0, 7))
+
+        ttk.Label(card, text="SVN", style="SvnChip.Card.TLabel").grid(
+            row=3, column=0, sticky="w"
+        )
+        self.svn_entry = ttk.Entry(card, textvariable=self.svn_var, style="Modern.TEntry")
+        self.svn_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(10, 8))
+        self.svn_browse_button = ttk.Button(
+            card,
+            text="Browse",
+            command=lambda: self._browse(self.svn_var),
+            style="Secondary.TButton",
+        )
+        self.svn_browse_button.grid(row=3, column=3, sticky="e")
+
+        action_bar = ttk.Frame(card, style="Card.TFrame")
+        action_bar.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(13, 0))
+        action_bar.columnconfigure(5, weight=1)
+        self.scan_button = ttk.Button(
+            action_bar, text="Scan", command=self.scan, style="Primary.TButton"
+        )
+        self.scan_button.grid(row=0, column=0, sticky="w")
+        self.run_button = ttk.Button(
+            action_bar,
+            text="Run selected",
+            command=self.run_selected,
+            style="Success.TButton",
+        )
+        self.run_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.update_git_button = ttk.Button(
+            action_bar,
+            text="Update GIT",
+            command=self.update_git,
+            style="Secondary.TButton",
+        )
+        self.update_git_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.update_button = ttk.Button(
+            action_bar,
+            text="Update SVN",
+            command=self.update_svn,
+            style="Secondary.TButton",
+        )
+        self.update_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        maintenance_menu = tk.Menu(self.root)
+        maintenance_menu.add_command(
+            label="Rebaseline ignore file", command=self.rebaseline
+        )
+        self.more_button = ttk.Menubutton(
+            action_bar,
+            text="More ▾",
+            menu=maintenance_menu,
+            style="Secondary.TButton",
+        )
+        self.more_button.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        self.progress = ttk.Progressbar(
+            action_bar,
+            mode="indeterminate",
+            length=150,
+            style="Modern.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=0, column=6, sticky="e", padx=(12, 0))
+        self.progress.grid_remove()
+        ttk.Label(
+            action_bar, textvariable=self.status_var, style="Muted.Card.TLabel"
+        ).grid(row=0, column=7, sticky="e", padx=(12, 0))
+
+    def _build_results_card(self) -> None:
+        card = ttk.Frame(self.content_pane, style="Card.TFrame")
+        self.results_card = card
+        self.content_pane.add(card, minsize=170, stretch="always")
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(card, style="Card.TFrame", padding=(16, 13, 16, 8))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header, textvariable=self.results_title_var, style="Section.Card.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header, textvariable=self.selection_var, style="Muted.Card.TLabel"
+        ).grid(row=0, column=1, sticky="e")
+
+        filter_bar = ttk.Frame(card, style="Card.TFrame", padding=(16, 0, 16, 10))
+        filter_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        filter_bar.columnconfigure(5, weight=1)
+        filters = (
+            (self.all_filter_text, FILTER_ALL),
+            (self.diff_filter_text, FILTER_DIFF),
+            (self.git_filter_text, FILTER_ONLY_GIT),
+            (self.svn_filter_text, FILTER_ONLY_SVN),
+        )
+        self.filter_buttons = []
+        for column, (text_var, value) in enumerate(filters):
+            button = ttk.Radiobutton(
+                filter_bar,
+                textvariable=text_var,
+                variable=self.filter_var,
+                value=value,
+                command=self._reload_tree,
+                style="Filter.Toolbutton",
+            )
+            button.grid(row=0, column=column, sticky="w", padx=(0, 6))
+            self.filter_buttons.append(button)
+        ttk.Label(filter_bar, text="Search", style="Muted.Card.TLabel").grid(
+            row=0, column=6, sticky="e", padx=(8, 7)
+        )
+        self.search_entry = ttk.Entry(
+            filter_bar,
+            textvariable=self.search_var,
+            width=28,
+            style="Modern.TEntry",
+        )
+        self.search_entry.grid(row=0, column=7, sticky="e")
+
+        columns = ("selected", "status", "action", "path", "author", "message")
+        self.tree = ttk.Treeview(
+            card,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+            style="Modern.Treeview",
+        )
+        headings = {
+            "selected": "SEL",
+            "status": "STATUS",
+            "action": "DIRECTION",
+            "path": "PATH",
+            "author": "AUTHOR",
+            "message": "MESSAGE",
+        }
+        widths = {
+            "selected": (52, False),
+            "status": (112, False),
+            "action": (125, False),
+            "path": (330, True),
+            "author": (125, False),
+            "message": (380, True),
+        }
+        for column in columns:
+            width, stretch = widths[column]
+            self.tree.heading(column, text=headings[column], anchor="w")
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=width if not stretch else 140,
+                anchor="center" if column == "selected" else "w",
+                stretch=stretch,
+            )
+        self.tree.grid(row=2, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        yscroll.grid(row=2, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=yscroll.set)
+        self.tree.tag_configure("even", background=COLORS["surface"])
+        self.tree.tag_configure("odd", background="#FAFCFF")
+        self.tree.bind("<Double-1>", self._toggle_selected)
+        self.tree.bind("<space>", self._toggle_selected)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_action_states())
+        self.message_tooltip = TreeMessageTooltip(self.tree, self._message_tooltip_text)
+
+        result_actions = ttk.Frame(card, style="Card.TFrame", padding=(12, 8))
+        result_actions.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.toggle_selected_button = ttk.Button(
+            result_actions,
+            text="Toggle selected",
+            command=self._toggle_selected,
+            style="Ghost.TButton",
+        )
+        self.toggle_selected_button.pack(side="left")
+        self.toggle_action_button = ttk.Button(
+            result_actions,
+            text="Switch add / remove",
+            command=self._toggle_action,
+            style="Ghost.TButton",
+        )
+        self.toggle_action_button.pack(side="left", padx=(5, 0))
+
+    def _build_activity_card(self) -> None:
+        self.activity_card = ttk.Frame(self.content_pane, style="Card.TFrame")
+        self.content_pane.add(self.activity_card, minsize=52, stretch="always")
+        self.activity_card.columnconfigure(0, weight=1)
+        self.activity_card.rowconfigure(1, weight=1)
+        header = ttk.Frame(self.activity_card, style="Card.TFrame", padding=(16, 9))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Activity", style="Section.Card.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(
+            header, text="Clear", command=self._clear_log, style="Ghost.TButton"
+        ).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(
+            header, text="Copy", command=self._copy_log, style="Ghost.TButton"
+        ).grid(row=0, column=2, padx=(2, 0))
+        self.activity_toggle_button = ttk.Button(
+            header,
+            text="Hide",
+            command=self._toggle_activity,
+            style="Ghost.TButton",
+        )
+        self.activity_toggle_button.grid(row=0, column=3, padx=(2, 0))
+
+        self.activity_body = ttk.Frame(self.activity_card, style="Card.TFrame")
+        self.activity_body.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.activity_body.columnconfigure(0, weight=1)
+        self.activity_body.rowconfigure(0, weight=1)
+        self.log = tk.Text(
+            self.activity_body,
+            height=9,
+            wrap="none",
+            font=("TkFixedFont", 10),
+            background=COLORS["console"],
+            foreground=COLORS["console_text"],
+            insertbackground="#FFFFFF",
+            selectbackground="#334155",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=10,
+            pady=8,
+        )
+        self.log.grid(row=0, column=0, sticky="nsew")
+        log_y = ttk.Scrollbar(self.activity_body, orient="vertical", command=self.log.yview)
+        log_y.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=log_y.set)
+
+    def _config(self, rebaseline: bool = False) -> sync.SyncConfig:
+        preset = self.preset_var.get()
+        preset_name = None if preset == MANUAL_PRESET_LABEL else preset
+        return sync.SyncConfig(
+            git_root=None if preset_name else self.git_var.get().strip(),
+            svn_root=None if preset_name else self.svn_var.get().strip(),
+            preset_name=preset_name,
+            dry_run=self.dry_run_var.get(),
+            rebaseline=rebaseline,
+            auto_yes=True,
+        )
+
+    def _browse(self, var: tk.StringVar) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+
+    def _on_preset_changed(self, _event=None) -> None:
+        preset_name = self.preset_var.get()
+        if preset_name == MANUAL_PRESET_LABEL:
+            self.git_entry.configure(state="normal")
+            self.svn_entry.configure(state="normal")
+            if hasattr(self, "git_browse_button"):
+                self.git_browse_button.configure(state="normal")
+                self.svn_browse_button.configure(state="normal")
+            return
+        preset = sync.PRESETS[preset_name]
+        self.git_var.set(preset.git_root)
+        self.svn_var.set(preset.svn_root)
+        self.git_entry.configure(state="disabled")
+        self.svn_entry.configure(state="disabled")
+        if hasattr(self, "git_browse_button"):
+            self.git_browse_button.configure(state="disabled")
+            self.svn_browse_button.configure(state="disabled")
+
+    def scan(self) -> None:
+        if self._start_worker("Scanning..."):
+            # A new scan invalidates any previously executable plan, even if
+            # the new scan later reports an error.
+            self.current_plan = None
+            config = self._config(rebaseline=False)
+            scan_reporter = ScanCommandReporter(self.events)
+            self._run_worker(
+                lambda: self.events.put((
+                    "plan",
+                    sync.prepare_sync_plan(config, scan_reporter),
+                ))
+            )
+
+    def rebaseline(self) -> None:
+        if self._start_worker("Rebaselining..."):
+            config = self._config(rebaseline=True)
+
+            def work() -> None:
+                plan = sync.prepare_sync_plan(config, self.reporter)
+                added = sync.apply_rebaseline_plan(plan, self.reporter)
+                self.events.put(("rebaseline_done", plan, added))
+
+            self._run_worker(work)
+
+    def update_git(self) -> None:
+        if self._start_worker("Updating GIT..."):
+            config = self._config(rebaseline=False)
+
+            def work() -> None:
+                sync.safe_git_update_from_config(config, self.reporter)
+                self.events.put(("git_update_done",))
+
+            self._run_worker(work)
+
+    def update_svn(self) -> None:
+        if self._start_worker("Updating SVN..."):
+            config = self._config(rebaseline=False)
+
+            def work() -> None:
+                sync.safe_svn_update_from_config(config, self.reporter)
+                self.events.put(("svn_update_done",))
+
+            self._run_worker(work)
+
+    def run_selected(self) -> None:
+        if not self.current_plan:
+            messagebox.showinfo("git-svn-sync", "Scan before running selected operations.")
+            return
+        operations = selected_operations(self.rows)
+        if not operations:
+            messagebox.showinfo("git-svn-sync", "No selected operations to run.")
+            return
+        if self._start_worker("Running selected operations..."):
+            plan = dataclasses.replace(
+                self.current_plan,
+                config=dataclasses.replace(
+                    self.current_plan.config,
+                    dry_run=self.dry_run_var.get(),
+                ),
+            )
+
+            def work() -> None:
+                sync.execute_plan_operations(plan, operations, self.reporter)
+                self.events.put(("run_done",))
+
+            self._run_worker(work)
+
+    def _start_worker(self, status: str) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        self.status_var.set(status)
+        if hasattr(self, "progress"):
+            self.progress.grid()
+            self.progress.start(12)
+        self._refresh_action_states()
+        return True
+
+    def _finish_worker(self, status: str) -> None:
+        self.busy = False
+        self.status_var.set(status)
+        if hasattr(self, "progress"):
+            self.progress.stop()
+            self.progress.grid_remove()
+        self._refresh_action_states()
+
+    def _run_worker(self, target) -> None:
+        def wrapped() -> None:
+            try:
+                target()
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=wrapped, daemon=True).start()
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event = self.events.get_nowait()
+                self._handle_event(event)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
+
+    def _handle_event(self, event: tuple) -> None:
+        kind = event[0]
+        if kind == "message":
+            _kind, stream, text = event
+            self._append_log(text + "\n")
+        elif kind == "command":
+            self._append_command(event[1])
+        elif kind == "file_operation":
+            self._append_file_operation(event[1])
+        elif kind == "plan":
+            self.current_plan = event[1]
+            self._load_plan(self.current_plan)
+            self._finish_worker(
+                f"Scan complete: {len(self.rows)} item(s), dry run {'on' if self.current_plan.config.dry_run else 'off'}"
+            )
+        elif kind == "rebaseline_done":
+            _kind, plan, added = event
+            self.current_plan = plan
+            self.rows = []
+            self._reload_tree()
+            self._finish_worker(f"Rebaseline complete: {len(added)} path(s)")
+        elif kind == "run_done":
+            if hasattr(self, "dry_run_var") and not self.dry_run_var.get():
+                self.current_plan = None
+            self._finish_worker("Run complete")
+        elif kind == "svn_update_done":
+            self.current_plan = None
+            self._finish_worker("SVN update complete; scan again when ready")
+        elif kind == "git_update_done":
+            self.current_plan = None
+            self._finish_worker("Git update complete; scan again when ready")
+        elif kind == "error":
+            self._finish_worker("Error")
+            message = event[1]
+            self._append_log(f"ERROR: {message}\n")
+            if is_svn_update_required_error(message):
+                self._show_svn_update_error(message)
+            elif is_git_update_required_error(message):
+                self._show_git_update_error(message)
+            else:
+                messagebox.showerror("git-svn-sync", message)
+
+    def _show_svn_update_error(self, message: str) -> None:
+        self._show_update_error(
+            title="SVN Update Required",
+            message=message,
+            safety_text=(
+                "Update SVN will first run svn status. If tracked local changes "
+                "are found, it will refuse to run svn update."
+            ),
+            button_text="Update SVN",
+            action=self.update_svn,
+        )
+
+    def _show_git_update_error(self, message: str) -> None:
+        self._show_update_error(
+            title="Git Update Required",
+            message=message,
+            safety_text=(
+                "Update GIT will first inspect git status. If tracked or staged "
+                "local changes are found, it will refuse to pull. The pull is "
+                "restricted to fast-forward updates."
+            ),
+            button_text="Update GIT",
+            action=self.update_git,
+        )
+
+    def _show_update_error(
+        self,
+        title: str,
+        message: str,
+        safety_text: str,
+        button_text: str,
+        action: Callable[[], None],
+    ) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body,
+            text=message,
+            wraplength=560,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            body,
+            text=safety_text,
+            wraplength=560,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, sticky="e", pady=(14, 0))
+
+        def run_update() -> None:
+            dialog.destroy()
+            action()
+
+        ttk.Button(buttons, text=button_text, command=run_update).pack(side="right")
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="right", padx=(0, 8))
+
+        dialog.grab_set()
+        dialog.wait_visibility()
+        dialog.focus_set()
+
+    def _load_plan(self, plan: sync.SyncPlan) -> None:
+        self.rows = [
+            GuiPlanRow(item, selected=item.suggested_operation is not None)
+            for item in plan.items
+        ]
+        self.filter_var.set(FILTER_ALL)
+        self.search_var.set("")
+        self._update_result_summary()
+        self._reload_tree()
+
+    def _reload_tree(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+        self.message_tooltip.hide()
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        visible_index = 0
+        for index, row in enumerate(self.rows):
+            if not row_matches_filter(
+                row, self.filter_var.get(), self.search_var.get()
+            ):
+                continue
+            tag = "even" if visible_index % 2 == 0 else "odd"
+            self.tree.insert(
+                "", "end", iid=str(index), values=row_values(row), tags=(tag,)
+            )
+            visible_index += 1
+        self.results_title_var.set(
+            f"Changes  ·  {visible_index} shown"
+            if self.rows else "Changes"
+        )
+        self._refresh_action_states()
+
+    def _message_tooltip_text(self, item_id: str) -> str:
+        try:
+            operation = self.rows[int(item_id)].operation
+        except (ValueError, IndexError):
+            return ""
+        return operation.message if operation else ""
+
+    def _toggle_selected(self, _event=None) -> None:
+        for item_id in self.tree.selection():
+            row = self.rows[int(item_id)]
+            row.selected = not row.selected
+            self.tree.item(item_id, values=row_values(row))
+        self._update_result_summary()
+        self._refresh_action_states()
+
+    def _toggle_action(self) -> None:
+        for item_id in self.tree.selection():
+            row = self.rows[int(item_id)]
+            if row.item.alternate_operation:
+                row.use_alternate = not row.use_alternate
+                self.tree.item(item_id, values=row_values(row))
+        self._refresh_action_states()
+
+    def _update_result_summary(self) -> None:
+        diff_count = sum(row.item.kind == FILTER_DIFF for row in self.rows)
+        git_count = sum(row.item.kind == FILTER_ONLY_GIT for row in self.rows)
+        svn_count = sum(row.item.kind == FILTER_ONLY_SVN for row in self.rows)
+        selected_count = len(selected_operations(self.rows))
+        self.all_filter_text.set(f"All  {len(self.rows)}")
+        self.diff_filter_text.set(f"Different  {diff_count}")
+        self.git_filter_text.set(f"Only Git  {git_count}")
+        self.svn_filter_text.set(f"Only SVN  {svn_count}")
+        self.selection_var.set(
+            f"{selected_count} selected" if selected_count else "No changes selected"
+        )
+        if hasattr(self, "run_button"):
+            self.run_button.configure(
+                text=f"Run {selected_count} selected" if selected_count else "Run selected"
+            )
+
+    def _refresh_action_states(self) -> None:
+        if not hasattr(self, "scan_button"):
+            return
+        selected_count = len(selected_operations(self.rows))
+        normal_if_idle = "disabled" if self.busy else "normal"
+        self.scan_button.configure(state=normal_if_idle)
+        self.update_git_button.configure(state=normal_if_idle)
+        self.update_button.configure(state=normal_if_idle)
+        self.more_button.configure(state=normal_if_idle)
+        self.dry_run_toggle.configure(state=normal_if_idle)
+        self.preset.configure(state="disabled" if self.busy else "readonly")
+        manual_paths = self.preset_var.get() == MANUAL_PRESET_LABEL
+        path_state = "normal" if not self.busy and manual_paths else "disabled"
+        self.git_entry.configure(state=path_state)
+        self.svn_entry.configure(state=path_state)
+        self.git_browse_button.configure(state=path_state)
+        self.svn_browse_button.configure(state=path_state)
+        self.search_entry.configure(state=normal_if_idle)
+        for button in self.filter_buttons:
+            button.configure(state=normal_if_idle)
+        self.run_button.configure(
+            state="normal"
+            if not self.busy and self.current_plan is not None and selected_count
+            else "disabled"
+        )
+        has_tree_selection = bool(self.tree.selection()) and not self.busy
+        self.toggle_selected_button.configure(
+            state="normal" if has_tree_selection else "disabled"
+        )
+        can_switch = has_tree_selection and any(
+            self.rows[int(item_id)].item.alternate_operation is not None
+            for item_id in self.tree.selection()
+        )
+        self.toggle_action_button.configure(
+            state="normal" if can_switch else "disabled"
+        )
+
+    def _set_initial_panel_ratio(self) -> None:
+        if not hasattr(self, "content_pane") or len(self.content_pane.panes()) < 2:
+            return
+        height = self.content_pane.winfo_height()
+        if height > 1:
+            self.content_pane.sash_place(0, 0, int(height * 0.68))
+
+    def _restore_activity_sash(self) -> None:
+        height = self.content_pane.winfo_height()
+        if height <= 1:
+            return
+        position = self.activity_sash_position
+        if position is None:
+            position = int(height * 0.68)
+        self.content_pane.sash_place(0, 0, min(position, height - 52))
+
+    def _collapse_activity_sash(self) -> None:
+        height = self.content_pane.winfo_height()
+        if height > 1:
+            self.content_pane.sash_place(0, 0, max(0, height - 52))
+
+    def _toggle_activity(self) -> None:
+        self.activity_expanded = not self.activity_expanded
+        if self.activity_expanded:
+            self.activity_body.grid()
+            self.activity_toggle_button.configure(text="Hide")
+            self.root.after_idle(self._restore_activity_sash)
+        else:
+            if len(self.content_pane.panes()) >= 2:
+                self.activity_sash_position = self.content_pane.sash_coord(0)[1]
+            self.activity_body.grid_remove()
+            self.activity_toggle_button.configure(text="Show")
+            self.root.after_idle(self._collapse_activity_sash)
+
+    def _append_log(self, text: str) -> None:
+        self.log.insert("end", text)
+        self.log.see("end")
+
+    def _append_command(self, event: sync.CommandEvent) -> None:
+        prefix = "[dry-run] " if event.dry_run else ""
+        if event.planned:
+            prefix += "planned "
+        cwd = f" (cwd: {event.cwd})" if event.cwd else ""
+        self._append_log(f"{prefix}$ {sync.format_command(event.cmd)}{cwd}\n")
+        if event.stdout:
+            self._append_log(event.stdout.rstrip() + "\n")
+        if event.stderr:
+            self._append_log(event.stderr.rstrip() + "\n")
+        if event.returncode is not None:
+            self._append_log(f"exit code: {event.returncode}\n")
+
+    def _append_file_operation(self, event: sync.FileOperationEvent) -> None:
+        prefix = "[dry-run] " if event.dry_run else ""
+        if event.planned:
+            prefix += "planned "
+        if event.source and event.destination:
+            self._append_log(f"{prefix}{event.action} {event.source} -> {event.destination}\n")
+        else:
+            self._append_log(f"{prefix}{event.action} {event.relpath}\n")
+
+    def _clear_log(self) -> None:
+        self.log.delete("1.0", "end")
+
+    def _copy_log(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log.get("1.0", "end-1c"))
+
+
+def launch_gui() -> None:
+    root = tk.Tk()
+    GitSvnSyncApp(root)
+    root.mainloop()
 
 
 def main(argv: Optional[List[str]] = None):
