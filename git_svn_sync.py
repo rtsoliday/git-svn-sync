@@ -1388,13 +1388,17 @@ def operation_for_mismatch(
     git_root: Optional[str] = None,
     svn_root: Optional[str] = None,
     history_messages: Optional[List[str]] = None,
+    baseline_message: Optional[str] = None,
+    baseline_author: Optional[str] = None,
 ) -> Optional[SyncOperation]:
     """Build a copy operation using all source commits after the older change.
 
     The last change on the destination side is the best cross-VCS baseline
-    available because Git and SVN do not share revision identifiers.  Keep the
-    optional roots for backwards compatibility with callers that only need the
-    latest-message behavior.
+    available because Git and SVN do not share revision identifiers.  A commit
+    that originally mirrored that baseline has a slightly newer timestamp in
+    the source repository; omit that commit so its message is not bounced back
+    to the repository it came from.  Keep the optional roots for backwards
+    compatibility with callers that only need the latest-message behavior.
     """
     sides = mismatch_sides(st)
     if sides is None:
@@ -1416,6 +1420,16 @@ def operation_for_mismatch(
             messages = svn_log_messages_since(svn_root, st.relpath, older_ts)
         fallback = newer_msg or f"Sync {st.relpath} from SVN"
         destination = "git"
+
+    if baseline_message is None:
+        baseline_message = st.svn_msg if newer == "git" else st.git_msg
+    if baseline_author is None:
+        baseline_author = st.svn_author if newer == "git" else st.git_author
+    messages = without_mirrored_baseline(
+        messages,
+        baseline_message,
+        baseline_author,
+    )
 
     combined = "\n\n".join(messages) if messages else fallback
     commit_msg = augment_message(combined, newer_author)
@@ -1553,6 +1567,32 @@ def augment_message(msg: str, author: Optional[str]) -> str:
     if author:
         return f"{msg}\n\nOriginal author: {author}"
     return msg
+
+
+def without_mirrored_baseline(
+    messages: Iterable[str],
+    baseline_message: Optional[str],
+    baseline_author: Optional[str],
+) -> List[str]:
+    """Drop an oldest source commit that merely mirrored the destination.
+
+    Sync commits retain the source message and append ``Original author``.
+    Because the new commit's timestamp is later than the source revision's,
+    timestamp-based history ranges include it when syncing back.  Only the
+    oldest message can be that boundary commit.  A suffix match also handles a
+    mirror commit that combined several destination revisions.
+    """
+    filtered = list(messages)
+    if not filtered or not baseline_message:
+        return filtered
+
+    mirrored_suffix = augment_message(
+        baseline_message.strip(), baseline_author
+    ).strip()
+    oldest = filtered[0].strip()
+    if oldest == mirrored_suffix or oldest.endswith(f"\n\n{mirrored_suffix}"):
+        return filtered[1:]
+    return filtered
 
 
 def _path_under(root: str, path: str) -> bool:
@@ -1871,16 +1911,23 @@ def hydrate_operation_messages(
     items_by_path = {item.relpath: item for item in plan.items}
     svn_cutoffs: Dict[str, int] = {}
     for operation in selected:
-        if operation.action != "copy" or operation.destination != "git":
+        if operation.action != "copy":
             continue
         item = items_by_path.get(operation.relpath)
         if item is None:
             continue
         if item.kind == "diff":
             sides = mismatch_sides(item.status)
-            if sides is not None and sides[0] == "svn":
-                svn_cutoffs[operation.relpath] = sides[3]
-        elif item.kind == "only_svn":
+            if sides is not None:
+                if sides[0] == "svn":
+                    # Load the SVN commits that need to be copied to Git.
+                    svn_cutoffs[operation.relpath] = sides[3]
+                elif item.status.svn_ts is not None:
+                    # Load the current SVN baseline message so an earlier
+                    # SVN -> Git mirror commit can be removed from the Git
+                    # history before that history is copied back to SVN.
+                    svn_cutoffs[operation.relpath] = item.status.svn_ts - 1
+        elif item.kind == "only_svn" and operation.destination == "git":
             svn_cutoffs[operation.relpath] = -1
 
     if any(operation.action == "copy" for operation in selected):
@@ -1919,11 +1966,28 @@ def hydrate_operation_messages(
                 if sides is not None and sides[0] == "svn"
                 else None
             )
+            baseline_messages = (
+                svn_histories.get(operation.relpath, [])
+                if sides is not None and sides[0] == "git"
+                else []
+            )
+            if sides is not None and sides[0] == "git":
+                baseline_message = (
+                    baseline_messages[-1]
+                    if baseline_messages
+                    else st.svn_msg
+                )
+                baseline_author = st.svn_author
+            else:
+                baseline_message = st.git_msg
+                baseline_author = st.git_author
             full_operation = operation_for_mismatch(
                 st,
                 plan.config.git_root,
                 plan.config.svn_root,
                 history_messages=prefetched,
+                baseline_message=baseline_message,
+                baseline_author=baseline_author,
             )
             hydrated.append(full_operation or operation)
             continue

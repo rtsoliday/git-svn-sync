@@ -124,6 +124,162 @@ class CommitMessageTests(unittest.TestCase):
         self.assertEqual(groups[0][0], ("svn", "latest git commit\n\nOriginal author: git-user"))
         self.assertEqual({op.relpath for op in groups[0][1]}, {"a.txt", "b.txt"})
 
+    def test_mismatch_omits_git_commit_that_mirrored_svn_baseline(self):
+        status = sync.FileStatus(
+            "src/momentumAperture.c",
+            True,
+            True,
+            False,
+            300,
+            "Implemented the batched search optimization.",
+            "rtsoliday",
+            100,
+            "Renamed confusing variables.",
+            "borland",
+        )
+
+        with patch.object(
+            sync,
+            "git_log_messages_since",
+            return_value=[
+                "Renamed confusing variables.\n\nOriginal author: borland",
+                "Implemented the batched search optimization.",
+            ],
+        ):
+            operation = sync.operation_for_mismatch(status, "/git", "/svn")
+
+        self.assertEqual(
+            operation,
+            sync.SyncOperation(
+                "src/momentumAperture.c",
+                "svn",
+                "copy",
+                "Implemented the batched search optimization.\n\n"
+                "Original author: rtsoliday",
+            ),
+        )
+
+    def test_mismatch_omits_only_oldest_matching_mirror_message(self):
+        status = sync.FileStatus(
+            "file.txt",
+            True,
+            True,
+            False,
+            300,
+            "Baseline message",
+            "git-user",
+            100,
+            "Baseline message",
+            "svn-user",
+        )
+
+        operation = sync.operation_for_mismatch(
+            status,
+            history_messages=[
+                "Baseline message\n\nOriginal author: svn-user",
+                "Baseline message\n\nOriginal author: svn-user",
+            ],
+        )
+
+        self.assertEqual(
+            operation.message,
+            "Baseline message\n\nOriginal author: svn-user\n\n"
+            "Original author: git-user",
+        )
+
+    def test_mismatch_omits_svn_commit_that_mirrored_git_baseline(self):
+        status = sync.FileStatus(
+            "file.txt",
+            True,
+            True,
+            False,
+            100,
+            "Original Git change",
+            "git-user",
+            300,
+            "New SVN change",
+            "svn-user",
+        )
+
+        operation = sync.operation_for_mismatch(
+            status,
+            history_messages=[
+                "Original Git change\n\nOriginal author: git-user",
+                "New SVN change",
+            ],
+        )
+
+        self.assertEqual(
+            operation,
+            sync.SyncOperation(
+                "file.txt",
+                "git",
+                "copy",
+                "New SVN change\n\nOriginal author: svn-user",
+            ),
+        )
+
+    def test_hydration_loads_svn_baseline_before_filtering_git_history(self):
+        status = sync.FileStatus(
+            "src/momentumAperture.c",
+            True,
+            True,
+            False,
+            300,
+            "Implemented the batched search optimization.",
+            "rtsoliday",
+            100,
+            None,
+            "borland",
+        )
+        preview = sync.SyncOperation(
+            status.relpath,
+            "svn",
+            "copy",
+            "Implemented the batched search optimization.\n\n"
+            "Original author: rtsoliday",
+        )
+        item = sync.PlanItem(status.relpath, "diff", status, preview)
+        plan = sync.SyncPlan(
+            sync.SyncConfig("/git", "/svn"),
+            None,
+            1,
+            1,
+            (),
+            (),
+            (),
+            (),
+            (item,),
+        )
+
+        with patch.object(
+            sync,
+            "svn_log_messages_since_many",
+            return_value={status.relpath: ["Renamed confusing variables."]},
+        ) as svn_history, patch.object(
+            sync,
+            "git_log_messages_since",
+            return_value=[
+                "Renamed confusing variables.\n\nOriginal author: borland",
+                "Implemented the batched search optimization.",
+            ],
+        ):
+            hydrated = sync.hydrate_operation_messages(plan, [preview])
+
+        svn_history.assert_called_once_with("/svn", {status.relpath: 99})
+        self.assertEqual(
+            hydrated,
+            [
+                sync.SyncOperation(
+                    status.relpath,
+                    "svn",
+                    "copy",
+                    "Implemented the batched search optimization.\n\n"
+                    "Original author: rtsoliday",
+                )
+            ],
+        )
+
     def test_extract_svn_deleted_path_change_from_verbose_log(self):
         log_output = """------------------------------------------------------------------------
 r12 | svn-user | 2025-01-02 03:04:05 +0000 (Thu, 02 Jan 2025) | 1 line
