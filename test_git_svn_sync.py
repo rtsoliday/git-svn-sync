@@ -25,6 +25,69 @@ class CommitMessageTests(unittest.TestCase):
         self.assertIn("--since=1970-01-01T00:00:01Z", calls[0])
         self.assertNotIn("--since=1", calls[0])
 
+    def test_svn_newer_scan_uses_real_svn_message_in_git_operation(self):
+        signatures = iter([("file", "git-hash"), ("file", "svn-hash")])
+
+        with patch.object(
+            sync, "tracked_path_signature", side_effect=lambda _path: next(signatures)
+        ), patch.object(
+            sync,
+            "git_last_change",
+            return_value=(100, "Older Git message", "git-user"),
+        ), patch.object(
+            sync,
+            "svn_last_log_message",
+            return_value='Added "Ct" column to centroid output.',
+        ) as svn_message:
+            statuses = sync.compare_and_collect(
+                "/git",
+                "/svn",
+                {"src/sdds_support.c"},
+                {"src/sdds_support.c"},
+                svn_metadata={"src/sdds_support.c": (200, "borland")},
+            )
+
+        status = statuses["src/sdds_support.c"]
+        operation = sync.build_plan_items(statuses, "/git", "/svn")[
+            0
+        ].suggested_operation
+
+        svn_message.assert_called_once_with("/svn", "src/sdds_support.c")
+        self.assertEqual(status.svn_msg, 'Added "Ct" column to centroid output.')
+        self.assertEqual(
+            operation,
+            sync.SyncOperation(
+                "src/sdds_support.c",
+                "git",
+                "copy",
+                'Added "Ct" column to centroid output.\n\nOriginal author: borland',
+            ),
+        )
+
+    def test_git_newer_scan_does_not_request_svn_log_message(self):
+        signatures = iter([("file", "git-hash"), ("file", "svn-hash")])
+
+        with patch.object(
+            sync, "tracked_path_signature", side_effect=lambda _path: next(signatures)
+        ), patch.object(
+            sync,
+            "git_last_change",
+            return_value=(200, "Newer Git message", "git-user"),
+        ), patch.object(
+            sync,
+            "svn_last_log_message",
+            side_effect=AssertionError("SVN is not the source"),
+        ):
+            statuses = sync.compare_and_collect(
+                "/git",
+                "/svn",
+                {"file.txt"},
+                {"file.txt"},
+                svn_metadata={"file.txt": (100, "svn-user")},
+            )
+
+        self.assertIsNone(statuses["file.txt"].svn_msg)
+
     def test_remove_from_git_uses_svn_deletion_message(self):
         with patch.object(sync, "prompt_yes_no", return_value=False), \
              patch.object(sync, "svn_last_change_or_deleted", return_value=(123, "deleted in svn", "svn-user")), \

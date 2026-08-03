@@ -729,6 +729,15 @@ def svn_last_change(
     except subprocess.CalledProcessError:
         return None, None, None
 
+
+def svn_last_log_message(svn_root: str, relpath: str) -> Optional[str]:
+    """Return the latest SVN log message for a path, if it can be read."""
+    try:
+        cp = run(["svn", "log", "-l", "1", "--", relpath], cwd=svn_root)
+    except subprocess.CalledProcessError:
+        return None
+    return extract_last_svn_log_message(cp.stdout).strip() or None
+
 def svn_log_messages_since(svn_root: str, relpath: str, since_ts: Optional[int]) -> List[str]:
     """Return commit messages for relpath since the given timestamp (exclusive).
 
@@ -1171,10 +1180,12 @@ def compare_and_collect(
                 git_ts, git_msg, git_author = git_last_change(git_root, rel)
                 if svn_metadata is not None and rel in svn_metadata:
                     svn_ts, svn_author = svn_metadata[rel]
-                    # The message is loaded with the source history only if SVN
-                    # proves newer. Avoiding an unconditional remote log lookup
-                    # here is the main Scan performance improvement.
-                    svn_msg = None
+                    # Keep Scan fast by avoiding an SVN log request when Git is
+                    # the source.  When SVN is the source, retain its real log
+                    # message for the CLI/GUI preview and as a safe fallback if
+                    # the later bulk history request returns no entries.
+                    if (svn_ts or -1) > (git_ts or -1):
+                        svn_msg = svn_last_log_message(svn_root, rel)
                 else:
                     svn_ts, svn_msg, svn_author = svn_last_change(svn_root, rel)
         elif in_svn and svn_metadata is not None and rel in svn_metadata:
